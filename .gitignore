@@ -1,0 +1,42 @@
+# Private project notes
+design.md
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local model weights and experiment outputs
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+checkpoints/
+models/
+runs/
+wandb/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
