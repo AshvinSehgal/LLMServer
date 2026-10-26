@@ -24,12 +24,14 @@ class Model(nn.Module):
         super().__init__()
         self.dummy_parameter = nn.Parameter(torch.zeros(1))
         self.generation_config = SimpleNamespace(bos_token_id=bos_token_id, pad_token_id=pad_token_id, eos_token_id=eos_token_id)
-        self.config = SimpleNamespace(bos_token_id=bos_token_id, pad_token_id=pad_token_id, eos_token_id=eos_token_id)
+        self.config = SimpleNamespace(bos_token_id=bos_token_id, pad_token_id=pad_token_id, eos_token_id=eos_token_id, hidden_size=8, num_attention_heads=4, num_key_value_heads=2, num_hidden_layers=2, head_dim=2)
         self.token_ids_by_call = token_ids_by_call
         self.inference_mode_by_call = []
+        self.calls = []
 
-    def forward(self, input_ids, pos_ids, attention_mask):
+    def forward(self, input_ids, pos_ids, attention_mask, **kwargs):
         self.inference_mode_by_call.append(torch.is_inference_mode_enabled())
+        self.calls.append({"input_shape": tuple(input_ids.shape), "request_ids": kwargs["request_ids"], "start_pos": kwargs["start_pos"], "input_lens": kwargs["input_lens"], "kv_cache_manager": kwargs["kv_cache_manager"]})
         token_ids = self.token_ids_by_call.pop(0)
         assert len(token_ids) == input_ids.shape[0]
         logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 100, device=input_ids.device)
@@ -51,12 +53,16 @@ def test_engine_add_request():
 
 def test_engine_token_id_fallbacks():
     model = Model(token_ids_by_call=[], bos_token_id=None, pad_token_id=None, eos_token_id=None)
-    model.config = SimpleNamespace(bos_token_id=2, pad_token_id=5, eos_token_id=6)
+    model.config.bos_token_id = 2
+    model.config.pad_token_id = 5
+    model.config.eos_token_id = 6
     engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, pad_token_id=7, eos_token_id=8), max_new_tokens=20, max_batch_size=2, max_num_batched_tokens=20)
     assert engine.bos_token_id == 2
     assert engine.pad_token_id == 5
     assert engine.eos_token_ids == {6}
-    model.config = SimpleNamespace(bos_token_id=None, pad_token_id=None, eos_token_id=None)
+    model.config.bos_token_id = None
+    model.config.pad_token_id = None
+    model.config.eos_token_id = None
     engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, pad_token_id=7, eos_token_id=8), max_new_tokens=20, max_batch_size=2, max_num_batched_tokens=20)
     assert engine.bos_token_id == 3
     assert engine.pad_token_id == 7
@@ -75,6 +81,13 @@ def test_engine_prefill_batch_and_inference_mode():
     assert first_request.num_computed_tokens == 2
     assert second_request.num_computed_tokens == 2
     assert model.inference_mode_by_call == [True]
+    assert model.calls[0]["input_shape"] == (2, 2)
+    assert model.calls[0]["request_ids"] == [first_request.request_id, second_request.request_id]
+    assert model.calls[0]["start_pos"] == [0, 0]
+    assert model.calls[0]["input_lens"] == [2, 2]
+    assert model.calls[0]["kv_cache_manager"] is engine.kv_cache_manager
+    assert engine.kv_cache_manager.has_cache(first_request.request_id)
+    assert engine.kv_cache_manager.has_cache(second_request.request_id)
 
 def test_engine_decode_and_length_stopping_streams_incremental_text():
     model = Model(token_ids_by_call=[[50], [51]])
@@ -91,6 +104,11 @@ def test_engine_decode_and_length_stopping_streams_incremental_text():
     assert request.output_queue.get_nowait() == "lo"
     assert request.output_queue.get_nowait() is None
     assert model.inference_mode_by_call == [True, True]
+    assert [call["input_shape"] for call in model.calls] == [(1, 2), (1, 1)]
+    assert model.calls[1]["request_ids"] == [request.request_id]
+    assert model.calls[1]["start_pos"] == [2]
+    assert model.calls[1]["input_lens"] == [1]
+    assert not engine.kv_cache_manager.has_cache(request.request_id)
 
 def test_engine_eos_stopping():
     model = Model(token_ids_by_call=[[2]], eos_token_id=[2, 3])
@@ -102,10 +120,13 @@ def test_engine_eos_stopping():
     assert request.finish_reason == RequestFinishReason.EOS
     assert request not in engine.scheduler.running
     assert request.output_queue.get_nowait() is None
+    assert not engine.kv_cache_manager.has_cache(request.request_id)
 
 def test_engine_rejects_missing_bos_and_pad_token_ids():
     model = Model(token_ids_by_call=[], bos_token_id=None, pad_token_id=None)
-    model.config = SimpleNamespace(bos_token_id=None, pad_token_id=None, eos_token_id=2)
+    model.config.bos_token_id = None
+    model.config.pad_token_id = None
+    model.config.eos_token_id = 2
     with pytest.raises(ValueError):
         Engine(model=model, tokenizer=Tokenizer(bos_token_id=None), max_new_tokens=20, max_batch_size=2, max_num_batched_tokens=20)
     with pytest.raises(ValueError):
@@ -204,6 +225,7 @@ def test_engine_cancels_running_request_and_clears_queued_output():
     assert request.status == RequestStatus.CANCELLED
     assert request.finish_reason == RequestFinishReason.CANCELLED
     assert request not in engine.scheduler.running
+    assert not engine.kv_cache_manager.has_cache(request.request_id)
     assert request.output_queue.get_nowait() is None
     with pytest.raises(asyncio.QueueEmpty):
         request.output_queue.get_nowait()

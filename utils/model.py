@@ -11,10 +11,19 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
         self.mlp = MLP(hidden_size, intermediate_size, bias)
     
-    def forward(self, hidden_states, pos_embeddings, causal_mask):
+    def forward(self, hidden_states, pos_embeddings, causal_mask, kv_cache_manager=None, layer_index=None, request_ids=None, start_pos=None, input_lens=None):
         residual = hidden_states
         normalized_hidden_states = self.input_layernorm(residual)
-        attention_scores = self.self_attn(normalized_hidden_states, pos_embeddings, causal_mask)
+        attention_scores = self.self_attn(
+            normalized_hidden_states, 
+            pos_embeddings, 
+            causal_mask, 
+            kv_cache_manager=kv_cache_manager, 
+            layer_index=layer_index, 
+            request_ids=request_ids, 
+            start_pos=start_pos, 
+            input_lens=input_lens
+            )
         hidden_states = residual + attention_scores
         residual = hidden_states
         normalized_hidden_states = self.post_attention_layernorm(hidden_states)
@@ -33,7 +42,7 @@ class Model(nn.Module):
         self.norm = RMSNorm(hidden_size, rms_norm_eps)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         
-    def forward(self, input_ids, pos_ids=None, causal_mask=None):
+    def forward(self, input_ids, pos_ids=None, causal_mask=None, kv_cache_manager=None, request_ids=None, start_pos=None, input_lens=None):
         hidden_states = self.embed_tokens(input_ids)
         batch_size, seq_len = input_ids.shape
         if pos_ids is None:
@@ -43,8 +52,17 @@ class Model(nn.Module):
         if causal_mask is None:
             mask_value = torch.finfo(hidden_states.dtype).min
             causal_mask = torch.full((batch_size, 1, seq_len, seq_len), mask_value, device=hidden_states.device, dtype=hidden_states.dtype).triu(diagonal=1)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, pos_embeddings, causal_mask)
+        for layer_index, layer in enumerate(self.layers):
+            hidden_states = layer(
+                hidden_states, 
+                pos_embeddings, 
+                causal_mask,
+                kv_cache_manager=kv_cache_manager,
+                layer_index=layer_index,
+                request_ids=request_ids,
+                start_pos=start_pos,
+                input_lens=input_lens
+                )
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
         return logits

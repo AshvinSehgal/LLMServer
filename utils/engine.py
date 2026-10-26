@@ -3,7 +3,8 @@ import uuid
 import torch
 from utils.scheduler import Scheduler
 from utils.request import Request, RequestStatus, RequestFinishReason
-from utils.batch import PrefillBatch, RecomputeDecodeBatch
+from utils.batch import PrefillBatch, DecodeBatch
+from utils.kv_cache import KVCacheManager
 
 STREAM_END = None
 
@@ -21,6 +22,15 @@ class Engine:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.scheduler = Scheduler(max_batch_size, max_num_batched_tokens)
         self.requests = {}
+        config = self.model.config
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.kv_cache_manager = KVCacheManager(
+            num_layers=config.num_hidden_layers,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=head_dim,
+            device=self.device,
+            dtype=self.dtype
+        )
         if self.model.generation_config.bos_token_id is not None:
             self.bos_token_id = self.model.generation_config.bos_token_id
         elif self.model.config.bos_token_id is not None:
@@ -69,7 +79,8 @@ class Engine:
             request.output_queue.task_done()
     
     def release_request_resources(self, request):
-        pass
+        if self.kv_cache_manager.has_cache(request.request_id):
+            self.kv_cache_manager.free(request.request_id)
     
     def cancel_request(self, request_id):
         request = self.requests.get(request_id)
@@ -89,7 +100,15 @@ class Engine:
     
     @torch.inference_mode()
     def process_batch(self, batch):
-        logits = self.model(batch.input_ids, batch.pos_ids, batch.attention_mask)
+        logits = self.model(
+            batch.input_ids, 
+            batch.pos_ids, 
+            batch.attention_mask,
+            kv_cache_manager=self.kv_cache_manager,
+            request_ids=batch.request_ids,
+            start_pos=batch.start_pos,
+            input_lens=batch.input_lens
+            )
         last_real_logits = logits[torch.arange(batch.batch_size, device=logits.device), batch.last_token_indices]
         next_token_ids = torch.argmax(last_real_logits, dim=-1)
         return next_token_ids.tolist()
@@ -102,6 +121,7 @@ class Engine:
         else:
             return
         request.output_queue.put_nowait(STREAM_END)
+        self.release_request_resources(request)
     
     def stream_output(self, request):
         decoded_text = self.tokenizer.decode(request.generated_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
@@ -119,6 +139,9 @@ class Engine:
         scheduler_output = self.scheduler.schedule()
         decode_requests = scheduler_output.decode_requests
         prefill_requests = scheduler_output.prefill_requests
+        for request in prefill_requests:
+            max_seq_length = len(request.prompt_token_ids) + request.max_new_tokens
+            self.kv_cache_manager.allocate(request.request_id, max_seq_length)
         if prefill_requests:
             prefill_batch = PrefillBatch(prefill_requests, self.pad_token_id, self.device, self.dtype)
             next_token_ids = self.process_batch(prefill_batch)
@@ -126,7 +149,7 @@ class Engine:
                 request.complete_prefill()
                 self.accept_generated_token(request, token_id)
         if decode_requests:
-            decode_batch = RecomputeDecodeBatch(decode_requests, self.pad_token_id, self.device, self.dtype)
+            decode_batch = DecodeBatch(decode_requests, self.device, self.dtype)
             next_token_ids = self.process_batch(decode_batch)
             for request, token_id in zip(decode_requests, next_token_ids):
                 request.complete_decode()

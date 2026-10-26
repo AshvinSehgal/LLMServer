@@ -10,6 +10,9 @@ def test_prefill_batch():
     mask_value = torch.finfo(torch.float32).min
     expected_attention_mask = torch.tensor([[[[0, mask_value, mask_value, mask_value], [0, 0, mask_value, mask_value], [0, 0, mask_value, mask_value], [0, 0, mask_value, mask_value]]], [[[0, mask_value, mask_value, mask_value], [0, 0, mask_value, mask_value], [0, 0, 0, mask_value], [0, 0, 0, 0]]]], dtype=torch.float32)
     assert batch.requests == requests
+    assert batch.request_ids == ["req-1", "req-2"]
+    assert batch.start_pos == [0, 0]
+    assert batch.input_lens == [2, 4]
     assert batch.batch_size == 2
     assert batch.max_prompt_length == 4
     assert torch.equal(batch.prompt_lengths, torch.tensor([2, 4]))
@@ -38,7 +41,11 @@ def test_decode_batch():
     mask_value = torch.finfo(torch.float32).min
     expected_attention_mask = torch.tensor([[[[0, 0, 0, mask_value, mask_value, mask_value]]], [[[0, 0, 0, 0, 0, 0]]]], dtype=torch.float32)
     assert batch.requests == [first_request, second_request]
+    assert batch.request_ids == ["req-1", "req-2"]
+    assert batch.start_pos == [2, 5]
+    assert batch.input_lens == [1, 1]
     assert batch.batch_size == 2
+    assert torch.equal(batch.last_token_indices, torch.tensor([0, 0]))
     assert torch.equal(batch.input_ids, torch.tensor([[50], [61]]))
     assert torch.equal(batch.pos_ids, torch.tensor([[2], [5]]))
     assert torch.equal(batch.padding_mask, torch.tensor([[True, True, True, False, False, False], [True, True, True, True, True, True]]))
