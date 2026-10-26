@@ -45,28 +45,3 @@ class DecodeBatch:
         padding_keys_blocked = (~self.padding_mask).unsqueeze(1).unsqueeze(2)
         self.attention_mask = torch.zeros(padding_keys_blocked.shape, device=device, dtype=dtype).masked_fill_(padding_keys_blocked, torch.finfo(dtype).min)
         self.pos_ids = torch.tensor([request.num_computed_tokens for request in self.requests], device=device, dtype=torch.long).unsqueeze(1)
-
-class RecomputeDecodeBatch:
-    def __init__(self, requests, pad_token_id, device, dtype):
-        if not requests:
-            raise ValueError("Empty requests not allowed")
-        for request in requests:
-            if request.status != RequestStatus.DECODING or len(request.generated_token_ids) == 0:
-                raise ValueError("Request is not in decoding stage or it has no generated tokens")
-        if pad_token_id is None:
-            raise ValueError("pad_token_id is required")
-        self.requests = requests
-        self.pad_token_id = pad_token_id
-        self.full_token_ids = [request.prompt_token_ids + request.generated_token_ids for request in self.requests]
-        seq_lengths = [len(request.prompt_token_ids) + len(request.generated_token_ids) for request in requests]
-        self.seq_lengths = torch.tensor(seq_lengths, device=device, dtype=torch.long)
-        self.max_seq_length = max(seq_lengths)
-        self.last_token_indices = self.seq_lengths - 1
-        self.input_ids = torch.tensor([(self.full_token_ids[i] + [self.pad_token_id] * (self.max_seq_length - seq_lengths[i])) for i in range(len(seq_lengths))], device=device, dtype=torch.long)
-        self.padding_mask = torch.tensor([([1] * seq_len + [0] * (self.max_seq_length - seq_len)) for seq_len in seq_lengths], device=device, dtype=torch.bool)
-        causal_blocked = torch.ones((self.max_seq_length, self.max_seq_length), device=device, dtype=torch.bool).triu(diagonal=1).unsqueeze(0).unsqueeze(0)
-        padding_keys_blocked = (~self.padding_mask).unsqueeze(1).unsqueeze(2)
-        combined_blocked = causal_blocked | padding_keys_blocked
-        self.attention_mask = torch.zeros(combined_blocked.shape, device=device, dtype=dtype).masked_fill_(combined_blocked, torch.finfo(dtype).min)
-        self.pos_ids = torch.tensor([(list(range(seq_len)) + [0] * (self.max_seq_length - seq_len)) for seq_len in seq_lengths], device=device, dtype=torch.long)
-        self.batch_size = len(requests)

@@ -1,4 +1,5 @@
 from enum import Enum
+from dataclasses import dataclass
 from datetime import datetime
 
 class RequestStatus(Enum):
@@ -13,6 +14,32 @@ class RequestFinishReason(Enum):
     LENGTH = "length"
     CANCELLED = "cancelled"
     ERROR = "error"
+
+@dataclass(frozen=True)
+class CompletedRequest:
+    request_id: str
+    status: RequestStatus
+    finish_reason: RequestFinishReason
+    created_at: datetime
+    finished_at: datetime
+    prompt_token_count: int
+    generated_token_count: int
+    output_text: str
+
+    @classmethod
+    def from_request(cls, request):
+        if request.status not in (RequestStatus.FINISHED, RequestStatus.CANCELLED):
+            raise ValueError("Only terminal requests can be stored in completed history")
+        return cls(
+            request_id=request.request_id,
+            status=request.status,
+            finish_reason=request.finish_reason,
+            created_at=request.created_at,
+            finished_at=request.finished_at,
+            prompt_token_count=len(request.prompt_token_ids),
+            generated_token_count=len(request.generated_token_ids),
+            output_text=request.emitted_text,
+        )
 
 class Request:
     def __init__(self, request_id, prompt, prompt_token_ids, max_new_tokens, output_queue):

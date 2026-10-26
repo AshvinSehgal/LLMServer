@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import asyncio
+from datetime import timedelta
 import torch
 import torch.nn as nn
 import pytest
@@ -50,6 +51,8 @@ def test_engine_add_request():
     assert empty_request.request_id != normal_request.request_id
     assert empty_request.output_queue is not normal_request.output_queue
     assert list(engine.scheduler.waiting) == [empty_request, normal_request]
+    assert engine.active_requests == {empty_request.request_id: empty_request, normal_request.request_id: normal_request}
+    assert engine.completed_requests == {}
 
 def test_engine_token_id_fallbacks():
     model = Model(token_ids_by_call=[], bos_token_id=None, pad_token_id=None, eos_token_id=None)
@@ -242,3 +245,40 @@ def test_engine_rejects_unknown_repeated_and_finished_cancellation():
     assert not engine.cancel_request(finished_request.request_id)
     assert finished_request.status == RequestStatus.FINISHED
     assert finished_request.finish_reason == RequestFinishReason.EOS
+
+def test_engine_moves_terminal_requests_to_bounded_completed_history():
+    engine = Engine(model=Model(token_ids_by_call=[[2], [2], [2]]), tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=3, max_batch_size=1, max_num_batched_tokens=2, max_completed_requests=2)
+    first_request = engine.add_request("First")
+    assert not engine.step()
+    second_request = engine.add_request("Second")
+    assert not engine.step()
+    third_request = engine.add_request("Third")
+    assert not engine.step()
+    assert engine.active_requests == {}
+    assert list(engine.completed_requests) == [second_request.request_id, third_request.request_id]
+    assert first_request.request_id not in engine.completed_requests
+    completed_request = engine.completed_requests[third_request.request_id]
+    assert completed_request.request_id == third_request.request_id
+    assert completed_request.status == RequestStatus.FINISHED
+    assert completed_request.finish_reason == RequestFinishReason.EOS
+    assert completed_request.prompt_token_count == 2
+    assert completed_request.generated_token_count == 1
+    assert completed_request.output_text == ""
+    assert not hasattr(completed_request, "prompt")
+    assert not hasattr(completed_request, "output_queue")
+    assert not hasattr(completed_request, "generated_token_ids")
+
+def test_engine_prunes_completed_history_after_ttl():
+    engine = Engine(model=Model(token_ids_by_call=[[2]]), tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=3, max_batch_size=1, max_num_batched_tokens=2, completed_request_ttl_seconds=10)
+    request = engine.add_request("Hello")
+    assert not engine.step()
+    completed_request = engine.completed_requests[request.request_id]
+    engine.prune_completed_requests(now=completed_request.finished_at + timedelta(seconds=11))
+    assert engine.completed_requests == {}
+
+def test_engine_can_disable_completed_history():
+    engine = Engine(model=Model(token_ids_by_call=[[2]]), tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=3, max_batch_size=1, max_num_batched_tokens=2, max_completed_requests=0)
+    request = engine.add_request("Hello")
+    assert not engine.step()
+    assert request.request_id not in engine.active_requests
+    assert engine.completed_requests == {}

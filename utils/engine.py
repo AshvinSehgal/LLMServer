@@ -1,15 +1,17 @@
 import asyncio
 import uuid
+from collections import OrderedDict
+from datetime import datetime, timedelta
 import torch
 from utils.scheduler import Scheduler
-from utils.request import Request, RequestStatus, RequestFinishReason
+from utils.request import Request, RequestStatus, RequestFinishReason, CompletedRequest
 from utils.batch import PrefillBatch, DecodeBatch
 from utils.kv_cache import KVCacheManager
 
 STREAM_END = None
 
 class Engine:
-    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens):
+    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600):
         self.model = model
         self.tokenizer = tokenizer
         self.device = next(model.parameters()).device
@@ -18,10 +20,17 @@ class Engine:
             raise ValueError("max_new_tokens is <= 0")
         if max_num_batched_tokens <= 0:
             raise ValueError("max_num_batched_tokens is <= 0")
+        if max_completed_requests < 0:
+            raise ValueError("max_completed_requests cannot be negative")
+        if completed_request_ttl_seconds < 0:
+            raise ValueError("completed_request_ttl_seconds cannot be negative")
         self.max_new_tokens = max_new_tokens
         self.max_num_batched_tokens = max_num_batched_tokens
+        self.max_completed_requests = max_completed_requests
+        self.completed_request_ttl = timedelta(seconds=completed_request_ttl_seconds)
         self.scheduler = Scheduler(max_batch_size, max_num_batched_tokens)
-        self.requests = {}
+        self.active_requests = {}
+        self.completed_requests = OrderedDict()
         config = self.model.config
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.kv_cache_manager = KVCacheManager(
@@ -60,6 +69,7 @@ class Engine:
             self.eos_token_ids = set(eos_token_ids)
     
     def add_request(self, prompt):
+        self.prune_completed_requests()
         if not prompt or prompt.strip() == "":
             prompt_token_ids = [self.bos_token_id]
         else:
@@ -69,9 +79,29 @@ class Engine:
         request_id = f"req-{uuid.uuid4()}"
         output_queue = asyncio.Queue()
         request = Request(request_id, prompt, prompt_token_ids, self.max_new_tokens, output_queue)
-        self.requests[request.request_id] = request
+        self.active_requests[request.request_id] = request
         self.scheduler.waiting.append(request)
         return request
+
+    def prune_completed_requests(self, now=None):
+        if now is None:
+            now = datetime.now()
+        while self.completed_requests:
+            oldest_request = next(iter(self.completed_requests.values()))
+            if now - oldest_request.finished_at < self.completed_request_ttl:
+                break
+            self.completed_requests.popitem(last=False)
+        while len(self.completed_requests) > self.max_completed_requests:
+            self.completed_requests.popitem(last=False)
+
+    def archive_request(self, request):
+        self.active_requests.pop(request.request_id, None)
+        if self.max_completed_requests == 0:
+            return
+        completed_request = CompletedRequest.from_request(request)
+        self.completed_requests[request.request_id] = completed_request
+        self.completed_requests.move_to_end(request.request_id)
+        self.prune_completed_requests()
     
     def clear_output_queue(self, request):
         while not request.output_queue.empty():
@@ -83,7 +113,8 @@ class Engine:
             self.kv_cache_manager.free(request.request_id)
     
     def cancel_request(self, request_id):
-        request = self.requests.get(request_id)
+        self.prune_completed_requests()
+        request = self.active_requests.get(request_id)
         if request is None:
             return False
         if request.status in (RequestStatus.FINISHED, RequestStatus.CANCELLED):
@@ -96,6 +127,7 @@ class Engine:
         self.clear_output_queue(request)
         request.output_queue.put_nowait(STREAM_END)
         self.release_request_resources(request)
+        self.archive_request(request)
         return True
     
     @torch.inference_mode()
@@ -122,6 +154,7 @@ class Engine:
             return
         request.output_queue.put_nowait(STREAM_END)
         self.release_request_resources(request)
+        self.archive_request(request)
     
     def stream_output(self, request):
         decoded_text = self.tokenizer.decode(request.generated_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)

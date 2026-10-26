@@ -12,12 +12,14 @@ The project currently targets the Qwen3 architecture and uses Hugging Face only 
 - Greedy decoding with EOS and maximum-length stopping
 - Incremental text streaming through `asyncio.Queue`
 - Waiting and running request queues
-- Padded prefill batches and recompute-based decode batches
+- Padded prefill batches and single-token decode batches
 - Continuous batching with batch-size and token-budget limits
 - Request cancellation and lifecycle tracking
+- Bounded, time-limited summaries for completed requests
 - Per-request contiguous KV-cache allocation, append, read and free operations
+- KV-cache integration across the engine, model layers and grouped-query attention
 
-The contiguous KV cache is currently tested independently and is not yet connected to the attention forward pass. Until that integration is complete, decode uses full-sequence recomputation.
+Prefill writes each request's keys and values into its own contiguous cache. Later decode steps process only the newest token and attend to the previously cached history. Finished and cancelled requests release their cache allocations.
 
 ## Project structure
 
@@ -64,6 +66,6 @@ python -m pytest -q tests/test_request.py tests/test_scheduler.py tests/test_bat
 
 ## Development status
 
-The single-request model, custom transformer implementation and multi-request scheduler are complete. The current work is integrating the contiguous KV cache into attention so decode can process only the newest token instead of recomputing the full sequence.
+The single-request model, custom transformer implementation, multi-request scheduler and contiguous KV-cache manager are complete. The next development version replaces the per-request contiguous allocations with a paged KV cache, block tables and a shared free-block pool.
 
 This repository is a learning project rather than a production-ready inference server. Features such as paged attention, chunked prefill, prefix caching, optimized kernels, distributed inference and an HTTP API are planned for later iterations.

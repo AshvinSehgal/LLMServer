@@ -20,13 +20,11 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_dim = head_dim
         self.rope_theta = rope_theta
-        dim_indices = torch.arange(0, head_dim, 2, dtype=torch.float32)
-        inverse_frequencies = 1.0 / (rope_theta ** (dim_indices / head_dim))
-        self.register_buffer("inverse_frequencies", inverse_frequencies, persistent=False)
+        dim_indices = torch.arange(0, head_dim, 2, dtype=torch.long)
+        self.register_buffer("dim_indices", dim_indices, persistent=False)
     
     def forward(self, hidden_states, pos_ids):
-        dim_indices = torch.arange(0, self.head_dim, 2, device=hidden_states.device, dtype=torch.float32)
-        inverse_frequencies = 1.0 / (self.rope_theta ** (dim_indices / self.head_dim))
+        inverse_frequencies = 1.0 / (self.rope_theta ** (self.dim_indices.to(torch.float32) / self.head_dim))
         frequencies = pos_ids.to(torch.float32).unsqueeze(-1) * inverse_frequencies.view(1, 1, -1)
         angles = torch.cat([frequencies, frequencies], dim=-1)
         cosine = torch.cos(angles)
