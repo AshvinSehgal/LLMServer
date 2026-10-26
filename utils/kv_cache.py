@@ -108,6 +108,18 @@ class PagedKVCache:
         self.allocated_blocks.add(free_cache_block)
         self.num_allocated_blocks += 1
         return free_cache_block
+    
+    def get_token_location(self, block_table, token_pos):
+        if token_pos < 0:
+            raise ValueError(f"token_pos must be non-negative: {token_pos}")
+        logical_block = token_pos // self.block_size
+        if logical_block >= len(block_table):
+            raise IndexError(f"Block {logical_block} is out of bounds for the block table")
+        block_offset = token_pos % self.block_size
+        physical_block = block_table[logical_block]
+        if physical_block not in self.allocated_blocks:
+            raise KVCacheStateError(f"Block {logical_block} is not an allocated block")
+        return physical_block, block_offset
         
 
 

@@ -141,6 +141,67 @@ def test_paged_kv_cache_rejects_unallocated_and_double_free():
     assert cache.num_free_blocks == len(cache.free_blocks) == 3
     assert cache.num_allocated_blocks == len(cache.allocated_blocks) == 0
 
+@pytest.mark.parametrize("token_pos,expected_location", [(0, (0, 0)), (3, (0, 3)), (4, (2, 0)), (5, (2, 1)), (7, (2, 3))])
+def test_paged_kv_cache_gets_token_location_across_block_boundaries(token_pos, expected_location):
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    first_block = cache.allocate_block()
+    cache.allocate_block()
+    second_block = cache.allocate_block()
+    block_table = [first_block, second_block]
+    assert block_table == [0, 2]
+    assert cache.get_token_location(block_table, token_pos) == expected_location
+
+def test_paged_kv_cache_token_locations_are_request_specific():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    first_request_block_table = [cache.allocate_block()]
+    second_request_block_table = [cache.allocate_block()]
+    assert cache.get_token_location(first_request_block_table, 3) == (0, 3)
+    assert cache.get_token_location(second_request_block_table, 3) == (1, 3)
+
+def test_paged_kv_cache_token_location_does_not_mutate_allocator_state():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = [cache.allocate_block(), cache.allocate_block()]
+    free_blocks = list(cache.free_blocks)
+    allocated_blocks = cache.allocated_blocks.copy()
+    num_free_blocks = cache.num_free_blocks
+    num_allocated_blocks = cache.num_allocated_blocks
+    key_data_ptr = cache.key_cache.data_ptr()
+    value_data_ptr = cache.value_cache.data_ptr()
+    assert cache.get_token_location(block_table, 6) == (1, 2)
+    assert list(cache.free_blocks) == free_blocks
+    assert cache.allocated_blocks == allocated_blocks
+    assert cache.num_free_blocks == num_free_blocks
+    assert cache.num_allocated_blocks == num_allocated_blocks
+    assert cache.key_cache.data_ptr() == key_data_ptr
+    assert cache.value_cache.data_ptr() == value_data_ptr
+
+def test_paged_kv_cache_rejects_negative_token_position():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = [cache.allocate_block()]
+    with pytest.raises(ValueError):
+        cache.get_token_location(block_table, -1)
+
+@pytest.mark.parametrize("block_table,token_pos", [([], 0), ([0], 4)])
+def test_paged_kv_cache_rejects_token_without_logical_block(block_table, token_pos):
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    if block_table:
+        assert cache.allocate_block() == block_table[0]
+    with pytest.raises(IndexError):
+        cache.get_token_location(block_table, token_pos)
+
+def test_paged_kv_cache_rejects_unallocated_physical_block_in_table():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(KVCacheStateError):
+        cache.get_token_location([2], 0)
+
+def test_paged_kv_cache_rejects_freed_physical_block_in_table():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_id = cache.allocate_block()
+    block_table = [block_id]
+    cache.free_block(block_id)
+    with pytest.raises(KVCacheStateError):
+        cache.get_token_location(block_table, 0)
+
 @pytest.mark.parametrize("num_layers,num_blocks,block_size,num_kv_heads,head_dim", [(0, 8, 4, 2, 3), (2, 0, 4, 2, 3), (2, 8, 0, 2, 3), (2, 8, 4, 0, 3), (2, 8, 4, 2, 0)])
 def test_paged_kv_cache_rejects_invalid_dimensions(num_layers, num_blocks, block_size, num_kv_heads, head_dim):
     with pytest.raises(ValueError):
