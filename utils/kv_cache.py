@@ -137,6 +137,32 @@ class PagedKVCache:
                 raise KVCacheStateError(f"Block offset must be 0")
         else:
             raise KVCacheStateError(f"Block {logical_block} is out of bounds for the block table")
+    
+    def append(self, layer_index, block_table, start_pos, new_keys, new_values):
+        if layer_index < 0 or layer_index >= self.num_layers:
+            raise IndexError(f"Invalid layer index: {layer_index}, num_layers: {self.num_layers}")
+        if start_pos < 0:
+            raise ValueError(f"Start position cannot be negative: {start_pos}")
+        if new_keys.ndim != 3 or new_values.ndim != 3:
+            raise ValueError(f"Keys and values must have 3 dimensions: keys: {new_keys.ndim}, values: {new_values.ndim}")
+        if new_keys.shape != new_values.shape:
+            raise ValueError(f"Keys and value shapes must match: keys: {tuple(new_keys.shape)}, values: {tuple(new_values.shape)}")
+        if new_keys.shape[0] != self.num_kv_heads:
+            raise ValueError(f"Invalid number of KV heads: {new_keys.shape[0]}, expected: {self.num_kv_heads}")
+        if new_keys.shape[2] != self.head_dim:
+            raise ValueError(f"Invalid head dimension: {new_keys.shape[2]}, expected: {self.head_dim}")
+        if new_keys.device != self.key_cache.device or new_values.device != self.value_cache.device:
+            raise ValueError(f"Cache and input tensors must be on the same device: cache: {self.key_cache.device}, keys: {new_keys.device}, values: {new_values.device}")
+        if new_keys.dtype != self.key_cache.dtype or new_values.dtype != self.value_cache.dtype:
+            raise ValueError(f"Cache and input tensors must use the same dtype: cache: {self.key_cache.dtype}, keys: {new_keys.dtype}, values: {new_values.dtype}")
+        num_new_tokens = new_keys.shape[1]
+        if num_new_tokens <= 0:
+            raise ValueError(f"Cannot append zero tokens: {num_new_tokens}")
+        for new_token_index in range(num_new_tokens):
+            token_pos = start_pos + new_token_index
+            physical_block, block_offset = self.ensure_token_block(block_table, token_pos)
+            self.key_cache[layer_index, physical_block, block_offset, :, :] = new_keys[:, new_token_index, :]
+            self.value_cache[layer_index, physical_block, block_offset, :, :] = new_values[:, new_token_index, :]
         
 
 

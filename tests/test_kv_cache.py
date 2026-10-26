@@ -292,6 +292,121 @@ def test_paged_kv_cache_exhaustion_does_not_mutate_request_block_table():
     assert cache.num_free_blocks == 0
     assert cache.num_allocated_blocks == 1
 
+def test_paged_kv_cache_appends_tokens_inside_one_block():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = []
+    new_keys = torch.arange(18, dtype=torch.float32).reshape(2, 3, 3)
+    new_values = new_keys + 100
+    cache.append(layer_index=0, block_table=block_table, start_pos=0, new_keys=new_keys, new_values=new_values)
+    assert block_table == [0]
+    assert torch.equal(cache.key_cache[0, 0, :3], new_keys.permute(1, 0, 2))
+    assert torch.equal(cache.value_cache[0, 0, :3], new_values.permute(1, 0, 2))
+    assert torch.count_nonzero(cache.key_cache[0, 0, 3:]).item() == 0
+    assert torch.count_nonzero(cache.value_cache[0, 0, 3:]).item() == 0
+    assert torch.count_nonzero(cache.key_cache[1]).item() == 0
+    assert torch.count_nonzero(cache.value_cache[1]).item() == 0
+
+def test_paged_kv_cache_appends_across_block_boundary():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = []
+    new_keys = torch.arange(36, dtype=torch.float32).reshape(2, 6, 3)
+    new_values = new_keys + 100
+    cache.append(layer_index=0, block_table=block_table, start_pos=0, new_keys=new_keys, new_values=new_values)
+    assert block_table == [0, 1]
+    assert torch.equal(cache.key_cache[0, 0], new_keys[:, :4].permute(1, 0, 2))
+    assert torch.equal(cache.value_cache[0, 0], new_values[:, :4].permute(1, 0, 2))
+    assert torch.equal(cache.key_cache[0, 1, :2], new_keys[:, 4:].permute(1, 0, 2))
+    assert torch.equal(cache.value_cache[0, 1, :2], new_values[:, 4:].permute(1, 0, 2))
+    assert torch.count_nonzero(cache.key_cache[0, 1, 2:]).item() == 0
+    assert torch.count_nonzero(cache.value_cache[0, 1, 2:]).item() == 0
+
+def test_paged_kv_cache_appends_decode_token_to_existing_block_table():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = []
+    prefill_keys = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+    prefill_values = prefill_keys + 100
+    cache.append(layer_index=0, block_table=block_table, start_pos=0, new_keys=prefill_keys, new_values=prefill_values)
+    decode_keys = torch.full((2, 1, 3), 200, dtype=torch.float32)
+    decode_values = torch.full((2, 1, 3), 300, dtype=torch.float32)
+    cache.append(layer_index=0, block_table=block_table, start_pos=4, new_keys=decode_keys, new_values=decode_values)
+    assert block_table == [0, 1]
+    assert torch.equal(cache.key_cache[0, 1, 0], decode_keys[:, 0])
+    assert torch.equal(cache.value_cache[0, 1, 0], decode_values[:, 0])
+
+def test_paged_kv_cache_layers_share_block_table_but_store_separate_values():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = []
+    first_layer_keys = torch.ones(2, 5, 3)
+    first_layer_values = torch.full((2, 5, 3), 2.0)
+    second_layer_keys = torch.full((2, 5, 3), 3.0)
+    second_layer_values = torch.full((2, 5, 3), 4.0)
+    cache.append(layer_index=0, block_table=block_table, start_pos=0, new_keys=first_layer_keys, new_values=first_layer_values)
+    cache.append(layer_index=1, block_table=block_table, start_pos=0, new_keys=second_layer_keys, new_values=second_layer_values)
+    assert block_table == [0, 1]
+    assert cache.num_allocated_blocks == 2
+    assert torch.equal(cache.key_cache[0, 0], first_layer_keys[:, :4].permute(1, 0, 2))
+    assert torch.equal(cache.value_cache[0, 1, 0], first_layer_values[:, 4])
+    assert torch.equal(cache.key_cache[1, 0], second_layer_keys[:, :4].permute(1, 0, 2))
+    assert torch.equal(cache.value_cache[1, 1, 0], second_layer_values[:, 4])
+
+def test_paged_kv_cache_appends_through_non_contiguous_physical_blocks():
+    cache = PagedKVCache(num_layers=1, num_blocks=5, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    unrelated_first_block = cache.allocate_block()
+    block_table = []
+    first_keys = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+    first_values = first_keys + 100
+    cache.append(layer_index=0, block_table=block_table, start_pos=0, new_keys=first_keys, new_values=first_values)
+    unrelated_middle_block = cache.allocate_block()
+    second_keys = torch.full((2, 1, 3), 200, dtype=torch.float32)
+    second_values = torch.full((2, 1, 3), 300, dtype=torch.float32)
+    cache.append(layer_index=0, block_table=block_table, start_pos=4, new_keys=second_keys, new_values=second_values)
+    assert unrelated_first_block == 0
+    assert unrelated_middle_block == 2
+    assert block_table == [1, 3]
+    assert torch.equal(cache.key_cache[0, 1], first_keys.permute(1, 0, 2))
+    assert torch.equal(cache.value_cache[0, 3, 0], second_values[:, 0])
+    assert torch.count_nonzero(cache.key_cache[0, 0]).item() == 0
+    assert torch.count_nonzero(cache.key_cache[0, 2]).item() == 0
+
+def test_paged_kv_cache_append_does_not_reallocate_storage():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = []
+    key_data_ptr = cache.key_cache.data_ptr()
+    value_data_ptr = cache.value_cache.data_ptr()
+    cache.append(layer_index=0, block_table=block_table, start_pos=0, new_keys=torch.ones(2, 5, 3), new_values=torch.ones(2, 5, 3))
+    assert cache.key_cache.data_ptr() == key_data_ptr
+    assert cache.value_cache.data_ptr() == value_data_ptr
+
+@pytest.mark.parametrize("layer_index,start_pos,error_type", [(-1, 0, IndexError), (2, 0, IndexError), (0, -1, ValueError)])
+def test_paged_kv_cache_rejects_invalid_append_location(layer_index, start_pos, error_type):
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(error_type):
+        cache.append(layer_index=layer_index, block_table=[], start_pos=start_pos, new_keys=torch.ones(2, 1, 3), new_values=torch.ones(2, 1, 3))
+
+def test_paged_kv_cache_rejects_invalid_append_shapes():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, block_table=[], start_pos=0, new_keys=torch.ones(2, 3), new_values=torch.ones(2, 3))
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, block_table=[], start_pos=0, new_keys=torch.ones(2, 1, 3), new_values=torch.ones(2, 2, 3))
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, block_table=[], start_pos=0, new_keys=torch.ones(3, 1, 3), new_values=torch.ones(3, 1, 3))
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, block_table=[], start_pos=0, new_keys=torch.ones(2, 1, 4), new_values=torch.ones(2, 1, 4))
+
+def test_paged_kv_cache_rejects_append_dtype_mismatch():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, block_table=[], start_pos=0, new_keys=torch.ones(2, 1, 3, dtype=torch.float64), new_values=torch.ones(2, 1, 3, dtype=torch.float64))
+
+def test_paged_kv_cache_rejects_append_with_zero_tokens():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = []
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, block_table=block_table, start_pos=0, new_keys=torch.empty(2, 0, 3), new_values=torch.empty(2, 0, 3))
+    assert block_table == []
+    assert cache.num_allocated_blocks == 0
+
 @pytest.mark.parametrize("num_layers,num_blocks,block_size,num_kv_heads,head_dim", [(0, 8, 4, 2, 3), (2, 0, 4, 2, 3), (2, 8, 0, 2, 3), (2, 8, 4, 0, 3), (2, 8, 4, 2, 0)])
 def test_paged_kv_cache_rejects_invalid_dimensions(num_layers, num_blocks, block_size, num_kv_heads, head_dim):
     with pytest.raises(ValueError):
