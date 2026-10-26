@@ -4,11 +4,11 @@ from utils.request import RequestStatus
 class Scheduler:
     def __init__(self, max_batch_size, max_num_batched_tokens):
         if max_batch_size <= 0:
-            raise ValueError("max_batch_size must be positive")
+            raise ValueError(f"max_batch_size must be positive: {max_batch_size}")
         if max_num_batched_tokens <= 0:
-            raise ValueError("max_num_batched_tokens must be positive")
+            raise ValueError(f"max_num_batched_tokens must be positive: {max_num_batched_tokens}")
         if max_num_batched_tokens < max_batch_size:
-            raise ValueError("max_num_batched_tokens must be >= max_batch_size")
+            raise ValueError(f"max_num_batched_tokens must be >= max_batch_size: max_num_batched_tokens: {max_num_batched_tokens}, max_batch_size: {max_batch_size}")
         self.max_batch_size = max_batch_size
         self.max_num_batched_tokens = max_num_batched_tokens
         self.waiting = deque()
@@ -24,7 +24,7 @@ class Scheduler:
             request = self.waiting[0]
             prompt_cost = len(request.prompt_token_ids)
             if prompt_cost > self.max_num_batched_tokens:
-                raise ValueError("Prompt is too large to process")
+                raise ValueError(f"Prompt is too large to process: prompt tokens: {prompt_cost}, max_num_batched_tokens: {self.max_num_batched_tokens}")
             if prompt_cost > remaining_tokens:
                 break
             request.start_prefill()

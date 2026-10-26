@@ -4,9 +4,9 @@ from utils.request import RequestStatus
 class PrefillBatch:
     def __init__(self, requests, pad_token_id, device, dtype):
         if not requests:
-            raise ValueError("Empty requests not allowed")
+            raise ValueError(f"Empty requests not allowed: {requests}")
         if pad_token_id is None:
-            raise ValueError("pad_token_id is required")
+            raise ValueError(f"pad_token_id is required: {pad_token_id}")
         self.requests = requests
         self.request_ids = [request.request_id for request in self.requests]
         self.start_pos = [0 for request in self.requests]
@@ -28,10 +28,10 @@ class PrefillBatch:
 class DecodeBatch:
     def __init__(self, requests, device, dtype):
         if not requests:
-            raise ValueError("Empty requests not allowed")
+            raise ValueError(f"Empty requests not allowed: {requests}")
         for request in requests:
             if len(request.generated_token_ids) == 0:
-                raise ValueError("Empty requests not allowed")
+                raise ValueError(f"Decode request must have at least one generated token: {request.request_id}")
         self.batch_size = len(requests)
         self.requests = requests
         self.request_ids = [request.request_id for request in self.requests]

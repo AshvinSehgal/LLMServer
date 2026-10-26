@@ -17,13 +17,13 @@ class Engine:
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
         if max_new_tokens <= 0:
-            raise ValueError("max_new_tokens is <= 0")
+            raise ValueError(f"max_new_tokens is <= 0: {max_new_tokens}")
         if max_num_batched_tokens <= 0:
-            raise ValueError("max_num_batched_tokens is <= 0")
+            raise ValueError(f"max_num_batched_tokens is <= 0: {max_num_batched_tokens}")
         if max_completed_requests < 0:
-            raise ValueError("max_completed_requests cannot be negative")
+            raise ValueError(f"max_completed_requests cannot be negative: {max_completed_requests}")
         if completed_request_ttl_seconds < 0:
-            raise ValueError("completed_request_ttl_seconds cannot be negative")
+            raise ValueError(f"completed_request_ttl_seconds cannot be negative: {completed_request_ttl_seconds}")
         self.max_new_tokens = max_new_tokens
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_completed_requests = max_completed_requests
@@ -47,7 +47,7 @@ class Engine:
         elif self.tokenizer.bos_token_id is not None:
             self.bos_token_id = self.tokenizer.bos_token_id
         else:
-            raise ValueError("Model bos_token_id not found")
+            raise ValueError(f"Model bos_token_id not found: generation_config: {self.model.generation_config.bos_token_id}, config: {self.model.config.bos_token_id}, tokenizer: {self.tokenizer.bos_token_id}")
         if self.model.generation_config.pad_token_id is not None:
             self.pad_token_id = self.model.generation_config.pad_token_id
         elif self.model.config.pad_token_id is not None:
@@ -55,7 +55,7 @@ class Engine:
         elif self.tokenizer.pad_token_id is not None:
             self.pad_token_id = self.tokenizer.pad_token_id
         else:
-            raise ValueError("Model pad_token_id not found")
+            raise ValueError(f"Model pad_token_id not found: generation_config: {self.model.generation_config.pad_token_id}, config: {self.model.config.pad_token_id}, tokenizer: {self.tokenizer.pad_token_id}")
         eos_token_ids = self.model.generation_config.eos_token_id
         if eos_token_ids is None:
             eos_token_ids = self.model.config.eos_token_id
@@ -75,7 +75,7 @@ class Engine:
         else:
             prompt_token_ids = self.tokenizer(prompt)["input_ids"]
         if len(prompt_token_ids) > self.max_num_batched_tokens:
-            raise ValueError("Prompt is too large to process")
+            raise ValueError(f"Prompt is too large to process: prompt tokens: {len(prompt_token_ids)}, max_num_batched_tokens: {self.max_num_batched_tokens}")
         request_id = f"req-{uuid.uuid4()}"
         output_queue = asyncio.Queue()
         request = Request(request_id, prompt, prompt_token_ids, self.max_new_tokens, output_queue)

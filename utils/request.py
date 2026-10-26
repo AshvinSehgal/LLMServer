@@ -29,7 +29,7 @@ class CompletedRequest:
     @classmethod
     def from_request(cls, request):
         if request.status not in (RequestStatus.FINISHED, RequestStatus.CANCELLED):
-            raise ValueError("Only terminal requests can be stored in completed history")
+            raise RequestStateError(f"Only terminal requests can be stored in completed history: current request status is {request.status.value}")
         return cls(
             request_id=request.request_id,
             status=request.status,
@@ -55,31 +55,32 @@ class Request:
         self.finish_reason = None
         self.created_at = datetime.now()
         self.finished_at = None
+        self.block_table = []
     
     def start_prefill(self):
         if self.status != RequestStatus.WAITING:
-            raise ValueError("Request cannot be put for prefill , it is not in the waiting stage")
+            raise RequestStateError(f"Request cannot be put for prefill, current request status is {self.status.value}")
         self.status = RequestStatus.PREFILL
     
     def complete_prefill(self):
         if self.status != RequestStatus.PREFILL:
-            raise ValueError("Request prefill cannot be completed, it is not in the prefill stage")
+            raise RequestStateError(f"Request prefill cannot be completed, current request status is {self.status.value}")
         self.status = RequestStatus.DECODING
         self.num_computed_tokens = len(self.prompt_token_ids)
         
     def append_generated_token(self, token_id):
         if self.status != RequestStatus.DECODING:
-            raise ValueError("Request is not in the decoding stage")
+            raise RequestStateError(f"Request is not in the decoding stage: current request status is {self.status.value}")
         self.generated_token_ids.append(token_id)
     
     def complete_decode(self):
         if self.status != RequestStatus.DECODING:
-            raise ValueError("Request decoding cannot be completed, it is not in the decoding stage")
+            raise RequestStateError(f"Request decoding cannot be completed, it is not in the decoding stage: current request status is {self.status.value}")
         self.num_computed_tokens += 1
     
     def finish(self, finish_reason):
         if self.status in (RequestStatus.FINISHED, RequestStatus.CANCELLED):
-            raise ValueError("Request cannot be finished, it has already been finished or cancelled")
+            raise RequestStateError(f"Request cannot be finished, it has already been finished or cancelled: current request status is {self.status.value}")
         self.status = RequestStatus.FINISHED
         self.finish_reason = RequestFinishReason(finish_reason)
         self.finished_at = datetime.now()
@@ -88,3 +89,6 @@ class Request:
         self.status = RequestStatus.CANCELLED
         self.finish_reason = RequestFinishReason.CANCELLED
         self.finished_at = datetime.now()
+
+class RequestStateError(RuntimeError):
+    pass

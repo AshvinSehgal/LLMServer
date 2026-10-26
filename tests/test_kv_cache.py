@@ -2,7 +2,7 @@ import gc
 import weakref
 import torch
 import pytest
-from utils.kv_cache import ContiguousKVCache, PagedKVCache, KVCacheManager
+from utils.kv_cache import ContiguousKVCache, PagedKVCache, KVCacheManager, KVCacheExhaustedError, KVCacheStateError
 
 def test_contiguous_kv_cache():
     cache = ContiguousKVCache(num_layers=3, num_kv_heads=2, max_seq_length=8, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
@@ -108,7 +108,7 @@ def test_paged_kv_cache_rejects_allocation_when_exhausted():
     cache = PagedKVCache(num_layers=2, num_blocks=2, block_size=5, num_kv_heads=3, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
     assert cache.allocate_block() == 0
     assert cache.allocate_block() == 1
-    with pytest.raises(BufferError):
+    with pytest.raises(KVCacheExhaustedError):
         cache.allocate_block()
     assert cache.num_free_blocks == len(cache.free_blocks) == 0
     assert cache.num_allocated_blocks == len(cache.allocated_blocks) == 2
@@ -131,11 +131,11 @@ def test_paged_kv_cache_rejects_invalid_block_id_on_free(block_id):
 
 def test_paged_kv_cache_rejects_unallocated_and_double_free():
     cache = PagedKVCache(num_layers=2, num_blocks=3, block_size=5, num_kv_heads=3, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
-    with pytest.raises(BufferError):
+    with pytest.raises(KVCacheStateError):
         cache.free_block(0)
     block_id = cache.allocate_block()
     cache.free_block(block_id)
-    with pytest.raises(BufferError):
+    with pytest.raises(KVCacheStateError):
         cache.free_block(block_id)
     assert list(cache.free_blocks) == [1, 2, 0]
     assert cache.num_free_blocks == len(cache.free_blocks) == 3
@@ -219,21 +219,21 @@ def test_contiguous_kv_cache_get_allows_full_capacity():
     assert torch.equal(cached_keys, keys)
     assert torch.equal(cached_values, values)
 
-@pytest.mark.parametrize("layer_index,end_pos", [(-1, 1), (2, 1), (0, -1), (0, 0), (0, 6)])
-def test_contiguous_kv_cache_rejects_invalid_get_range(layer_index, end_pos):
+@pytest.mark.parametrize("layer_index,end_pos,error_type", [(-1, 1, IndexError), (2, 1, IndexError), (0, -1, ValueError), (0, 0, ValueError), (0, 6, ValueError)])
+def test_contiguous_kv_cache_rejects_invalid_get_range(layer_index, end_pos, error_type):
     cache = ContiguousKVCache(num_layers=2, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
-    with pytest.raises(ValueError):
+    with pytest.raises(error_type):
         cache.get(layer_index=layer_index, end_pos=end_pos)
 
-@pytest.mark.parametrize("layer_index,start_pos", [(-1, 0), (2, 0), (0, -1)])
-def test_contiguous_kv_cache_rejects_invalid_append_location(layer_index, start_pos):
+@pytest.mark.parametrize("layer_index,start_pos,error_type", [(-1, 0, IndexError), (2, 0, IndexError), (0, -1, ValueError)])
+def test_contiguous_kv_cache_rejects_invalid_append_location(layer_index, start_pos, error_type):
     cache = ContiguousKVCache(num_layers=2, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
-    with pytest.raises(ValueError):
+    with pytest.raises(error_type):
         cache.append(layer_index=layer_index, start_pos=start_pos, new_keys=torch.ones(2, 1, 3), new_values=torch.ones(2, 1, 3))
 
 def test_contiguous_kv_cache_rejects_capacity_overflow():
     cache = ContiguousKVCache(num_layers=1, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
-    with pytest.raises(ValueError):
+    with pytest.raises(KVCacheExhaustedError):
         cache.append(layer_index=0, start_pos=4, new_keys=torch.ones(2, 2, 3), new_values=torch.ones(2, 2, 3))
 
 def test_contiguous_kv_cache_rejects_invalid_append_shapes():
@@ -290,7 +290,7 @@ def test_kv_cache_manager_appends_to_requested_cache():
 
 def test_kv_cache_manager_rejects_append_for_unknown_request():
     manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
-    with pytest.raises(ValueError):
+    with pytest.raises(KeyError):
         manager.append("unknown", layer_index=0, start_pos=0, new_keys=torch.ones(2, 1, 3), new_values=torch.ones(2, 1, 3))
 
 def test_kv_cache_manager_gets_requested_cache():
@@ -309,7 +309,7 @@ def test_kv_cache_manager_gets_requested_cache():
 
 def test_kv_cache_manager_rejects_get_for_unknown_request():
     manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
-    with pytest.raises(ValueError):
+    with pytest.raises(KeyError):
         manager.get("unknown", layer_index=0, end_pos=1)
 
 def test_kv_cache_manager_frees_only_requested_cache():
@@ -330,11 +330,11 @@ def test_kv_cache_manager_frees_only_requested_cache():
 
 def test_kv_cache_manager_rejects_unknown_and_double_free():
     manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
-    with pytest.raises(ValueError):
+    with pytest.raises(KeyError):
         manager.free("unknown")
     manager.allocate("req-1", max_seq_length=5)
     manager.free("req-1")
-    with pytest.raises(ValueError):
+    with pytest.raises(KeyError):
         manager.free("req-1")
 
 def test_kv_cache_manager_allows_request_id_reuse_after_free():
