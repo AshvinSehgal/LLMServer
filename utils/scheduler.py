@@ -4,9 +4,9 @@ from utils.request import RequestStatus
 class Scheduler:
     def __init__(self, max_batch_size, max_num_batched_tokens):
         if max_batch_size <= 0:
-            raise ValueError("max_batch_size is <= 0")
+            raise ValueError("max_batch_size must be positive")
         if max_num_batched_tokens <= 0:
-            raise ValueError("max_num_batched_tokens is <= 0")
+            raise ValueError("max_num_batched_tokens must be positive")
         if max_num_batched_tokens < max_batch_size:
             raise ValueError("max_num_batched_tokens must be >= max_batch_size")
         self.max_batch_size = max_batch_size

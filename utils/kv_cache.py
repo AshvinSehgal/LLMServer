@@ -3,16 +3,16 @@ import torch
 class ContiguousKVCache:
     def __init__(self, num_layers, num_kv_heads, max_seq_length, head_dim, device, dtype):
         if num_layers <= 0:
-            raise ValueError("num_layers is <= 0")
+            raise ValueError("num_layers must be positive")
         self.num_layers = num_layers
         if num_kv_heads <= 0:
-            raise ValueError("num_kv_heads is <= 0")
+            raise ValueError("num_kv_heads must be positive")
         self.num_kv_heads = num_kv_heads
         if max_seq_length <= 0:
-            raise ValueError("max_seq_length is <= 0")
+            raise ValueError("max_seq_length must be positive")
         self.max_seq_length = max_seq_length
         if head_dim <= 0:
-            raise ValueError("head_dim is <= 0")
+            raise ValueError("head_dim must be positive")
         self.head_dim = head_dim
         self.device = device
         self.dtype = dtype
@@ -60,17 +60,45 @@ class ContiguousKVCache:
         values = self.value_cache[layer_index, :, :end_pos, :]
         return keys, values
 
+class PagedKVCache:
+    def __init__(self, num_layers, num_blocks, block_size, num_kv_heads, head_dim, device, dtype):
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        self.num_layers = num_layers
+        if num_blocks <= 0:
+            raise ValueError("num_blocks must be positive")
+        self.num_blocks = num_blocks
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+        self.block_size = block_size
+        if num_kv_heads <= 0:
+            raise ValueError("num_kv_heads must be positive")
+        self.num_kv_heads = num_kv_heads
+        if head_dim <= 0:
+            raise ValueError("head_dim must be positive")
+        self.head_dim = head_dim
+        self.device = device
+        self.dtype = dtype
+        # Cache layout:
+        # key_cache[num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        # value_cache[num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        cache_shape = (num_layers, num_blocks, block_size, num_kv_heads, head_dim)
+        self.key_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
+        self.value_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
+        
+        
+
 
 class KVCacheManager:
     def __init__(self, num_layers, num_kv_heads, head_dim, device, dtype):
         if num_layers <= 0:
-            raise ValueError("num_layers is <= 0")
+            raise ValueError("num_layers must be positive")
         self.num_layers = num_layers
         if num_kv_heads <= 0:
-            raise ValueError("num_kv_heads is <= 0")
+            raise ValueError("num_kv_heads must be positive")
         self.num_kv_heads = num_kv_heads
         if head_dim <= 0:
-            raise ValueError("head_dim is <= 0")
+            raise ValueError("head_dim must be positive")
         self.head_dim = head_dim
         self.device = device
         self.dtype = dtype
@@ -78,7 +106,7 @@ class KVCacheManager:
         
     def allocate(self, request_id, max_seq_length):
         if max_seq_length <= 0:
-            raise ValueError("max_seq_length is <= 0")
+            raise ValueError("max_seq_length must be positive")
         if request_id in self.caches:
             raise ValueError("Cache for this request already exists")
         kv_cache = ContiguousKVCache(self.num_layers, self.num_kv_heads, max_seq_length, self.head_dim, self.device, self.dtype)

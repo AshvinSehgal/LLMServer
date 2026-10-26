@@ -2,7 +2,7 @@ import gc
 import weakref
 import torch
 import pytest
-from utils.kv_cache import ContiguousKVCache, KVCacheManager
+from utils.kv_cache import ContiguousKVCache, PagedKVCache, KVCacheManager
 
 def test_contiguous_kv_cache():
     cache = ContiguousKVCache(num_layers=3, num_kv_heads=2, max_seq_length=8, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
@@ -39,6 +39,55 @@ def test_contiguous_kv_cache_layout():
     assert cache.value_cache[0, 1, 4, 2].item() == 9
     assert torch.count_nonzero(cache.key_cache).item() == 1
     assert torch.count_nonzero(cache.value_cache).item() == 1
+
+def test_paged_kv_cache():
+    cache = PagedKVCache(num_layers=3, num_blocks=8, block_size=5, num_kv_heads=2, head_dim=4, device=torch.device("cpu"), dtype=torch.float64)
+    assert cache.num_layers == 3
+    assert cache.num_blocks == 8
+    assert cache.block_size == 5
+    assert cache.num_kv_heads == 2
+    assert cache.head_dim == 4
+    assert cache.device == torch.device("cpu")
+    assert cache.dtype == torch.float64
+    assert cache.key_cache.shape == (3, 8, 5, 2, 4)
+    assert cache.value_cache.shape == (3, 8, 5, 2, 4)
+    assert cache.key_cache.device == torch.device("cpu")
+    assert cache.value_cache.device == torch.device("cpu")
+    assert cache.key_cache.dtype == torch.float64
+    assert cache.value_cache.dtype == torch.float64
+    assert cache.key_cache.is_contiguous()
+    assert cache.value_cache.is_contiguous()
+    assert torch.count_nonzero(cache.key_cache).item() == 0
+    assert torch.count_nonzero(cache.value_cache).item() == 0
+
+def test_paged_kv_cache_layout():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=5, num_kv_heads=3, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
+    assert cache.key_cache[1].shape == (4, 5, 3, 4)
+    assert cache.value_cache[1].shape == (4, 5, 3, 4)
+    assert cache.key_cache[1, 2].shape == (5, 3, 4)
+    assert cache.value_cache[1, 2].shape == (5, 3, 4)
+    assert cache.key_cache[1, 2, 3].shape == (3, 4)
+    assert cache.value_cache[1, 2, 3].shape == (3, 4)
+
+def test_paged_kv_cache_physical_blocks_are_isolated():
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=5, num_kv_heads=3, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
+    key_data_ptr = cache.key_cache.data_ptr()
+    value_data_ptr = cache.value_cache.data_ptr()
+    cache.key_cache[1, 2, 3, 0, 1] = 7
+    cache.value_cache[0, 3, 4, 2, 3] = 9
+    assert cache.key_cache[1, 2, 3, 0, 1].item() == 7
+    assert cache.value_cache[0, 3, 4, 2, 3].item() == 9
+    assert torch.count_nonzero(cache.key_cache).item() == 1
+    assert torch.count_nonzero(cache.value_cache).item() == 1
+    assert torch.count_nonzero(cache.key_cache[1, 1]).item() == 0
+    assert torch.count_nonzero(cache.value_cache[0, 2]).item() == 0
+    assert cache.key_cache.data_ptr() == key_data_ptr
+    assert cache.value_cache.data_ptr() == value_data_ptr
+
+@pytest.mark.parametrize("num_layers,num_blocks,block_size,num_kv_heads,head_dim", [(0, 8, 4, 2, 3), (2, 0, 4, 2, 3), (2, 8, 0, 2, 3), (2, 8, 4, 0, 3), (2, 8, 4, 2, 0)])
+def test_paged_kv_cache_rejects_invalid_dimensions(num_layers, num_blocks, block_size, num_kv_heads, head_dim):
+    with pytest.raises(ValueError):
+        PagedKVCache(num_layers=num_layers, num_blocks=num_blocks, block_size=block_size, num_kv_heads=num_kv_heads, head_dim=head_dim, device=torch.device("cpu"), dtype=torch.float32)
 
 def test_contiguous_kv_cache_appends_prefill_and_decode_tokens():
     cache = ContiguousKVCache(num_layers=2, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
