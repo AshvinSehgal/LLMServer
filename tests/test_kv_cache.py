@@ -1,0 +1,277 @@
+import gc
+import weakref
+import torch
+import pytest
+from utils.kv_cache import ContiguousKVCache, KVCacheManager
+
+def test_contiguous_kv_cache():
+    cache = ContiguousKVCache(num_layers=3, num_kv_heads=2, max_seq_length=8, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
+    assert cache.num_layers == 3
+    assert cache.num_kv_heads == 2
+    assert cache.max_seq_length == 8
+    assert cache.head_dim == 4
+    assert cache.device == torch.device("cpu")
+    assert cache.dtype == torch.float32
+    assert cache.key_cache.shape == (3, 2, 8, 4)
+    assert cache.value_cache.shape == (3, 2, 8, 4)
+    assert cache.key_cache.device == torch.device("cpu")
+    assert cache.value_cache.device == torch.device("cpu")
+    assert cache.key_cache.dtype == torch.float32
+    assert cache.value_cache.dtype == torch.float32
+    assert torch.count_nonzero(cache.key_cache).item() == 0
+    assert torch.count_nonzero(cache.value_cache).item() == 0
+
+def test_contiguous_kv_cache_layout():
+    cache = ContiguousKVCache(num_layers=2, num_kv_heads=3, max_seq_length=5, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
+    assert cache.key_cache.shape == (2, 3, 5, 4)
+    assert cache.value_cache.shape == (2, 3, 5, 4)
+    assert cache.key_cache[1].shape == (3, 5, 4)
+    assert cache.value_cache[1].shape == (3, 5, 4)
+    assert cache.key_cache[1, :, 2, :].shape == (3, 4)
+    assert cache.value_cache[1, :, 2, :].shape == (3, 4)
+    assert cache.key_cache[1, :, :3, :].shape == (3, 3, 4)
+    assert cache.value_cache[1, :, :3, :].shape == (3, 3, 4)
+    assert cache.key_cache.is_contiguous()
+    assert cache.value_cache.is_contiguous()
+    cache.key_cache[1, 2, 3, 0] = 7
+    cache.value_cache[0, 1, 4, 2] = 9
+    assert cache.key_cache[1, 2, 3, 0].item() == 7
+    assert cache.value_cache[0, 1, 4, 2].item() == 9
+    assert torch.count_nonzero(cache.key_cache).item() == 1
+    assert torch.count_nonzero(cache.value_cache).item() == 1
+
+def test_contiguous_kv_cache_appends_prefill_and_decode_tokens():
+    cache = ContiguousKVCache(num_layers=2, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    prefill_keys = torch.arange(18, dtype=torch.float32).reshape(2, 3, 3)
+    prefill_values = prefill_keys + 100
+    cache.append(layer_index=0, start_pos=0, new_keys=prefill_keys, new_values=prefill_values)
+    assert torch.equal(cache.key_cache[0, :, :3, :], prefill_keys)
+    assert torch.equal(cache.value_cache[0, :, :3, :], prefill_values)
+    assert torch.count_nonzero(cache.key_cache[0, :, 3:, :]).item() == 0
+    assert torch.count_nonzero(cache.value_cache[0, :, 3:, :]).item() == 0
+    assert torch.count_nonzero(cache.key_cache[1]).item() == 0
+    assert torch.count_nonzero(cache.value_cache[1]).item() == 0
+    decode_keys = torch.full((2, 1, 3), 200, dtype=torch.float32)
+    decode_values = torch.full((2, 1, 3), 300, dtype=torch.float32)
+    cache.append(layer_index=0, start_pos=3, new_keys=decode_keys, new_values=decode_values)
+    assert torch.equal(cache.key_cache[0, :, 3:4, :], decode_keys)
+    assert torch.equal(cache.value_cache[0, :, 3:4, :], decode_values)
+    assert torch.count_nonzero(cache.key_cache[0, :, 4:, :]).item() == 0
+    assert torch.count_nonzero(cache.value_cache[0, :, 4:, :]).item() == 0
+
+def test_contiguous_kv_cache_allows_write_ending_at_capacity():
+    cache = ContiguousKVCache(num_layers=1, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    keys = torch.ones(2, 2, 3)
+    values = torch.full((2, 2, 3), 2.0)
+    cache.append(layer_index=0, start_pos=3, new_keys=keys, new_values=values)
+    assert torch.equal(cache.key_cache[0, :, 3:5, :], keys)
+    assert torch.equal(cache.value_cache[0, :, 3:5, :], values)
+
+def test_contiguous_kv_cache_gets_prefill_and_decode_prefixes():
+    cache = ContiguousKVCache(num_layers=2, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    prefill_keys = torch.arange(18, dtype=torch.float32).reshape(2, 3, 3)
+    prefill_values = prefill_keys + 100
+    cache.append(layer_index=0, start_pos=0, new_keys=prefill_keys, new_values=prefill_values)
+    cached_keys, cached_values = cache.get(layer_index=0, end_pos=3)
+    assert cached_keys.shape == (2, 3, 3)
+    assert cached_values.shape == (2, 3, 3)
+    assert torch.equal(cached_keys, prefill_keys)
+    assert torch.equal(cached_values, prefill_values)
+    decode_keys = torch.full((2, 1, 3), 200, dtype=torch.float32)
+    decode_values = torch.full((2, 1, 3), 300, dtype=torch.float32)
+    cache.append(layer_index=0, start_pos=3, new_keys=decode_keys, new_values=decode_values)
+    cached_keys, cached_values = cache.get(layer_index=0, end_pos=4)
+    assert cached_keys.shape == (2, 4, 3)
+    assert cached_values.shape == (2, 4, 3)
+    assert torch.equal(cached_keys, torch.cat([prefill_keys, decode_keys], dim=1))
+    assert torch.equal(cached_values, torch.cat([prefill_values, decode_values], dim=1))
+
+def test_contiguous_kv_cache_get_is_layer_specific_and_returns_views():
+    cache = ContiguousKVCache(num_layers=2, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    first_layer_keys = torch.ones(2, 2, 3)
+    first_layer_values = torch.full((2, 2, 3), 2.0)
+    second_layer_keys = torch.full((2, 2, 3), 3.0)
+    second_layer_values = torch.full((2, 2, 3), 4.0)
+    cache.append(layer_index=0, start_pos=0, new_keys=first_layer_keys, new_values=first_layer_values)
+    cache.append(layer_index=1, start_pos=0, new_keys=second_layer_keys, new_values=second_layer_values)
+    cached_keys, cached_values = cache.get(layer_index=1, end_pos=2)
+    assert torch.equal(cached_keys, second_layer_keys)
+    assert torch.equal(cached_values, second_layer_values)
+    cached_keys[0, 0, 0] = 9
+    cached_values[0, 0, 0] = 10
+    assert cache.key_cache[1, 0, 0, 0].item() == 9
+    assert cache.value_cache[1, 0, 0, 0].item() == 10
+    assert cache.key_cache[0, 0, 0, 0].item() == 1
+    assert cache.value_cache[0, 0, 0, 0].item() == 2
+
+def test_contiguous_kv_cache_get_allows_full_capacity():
+    cache = ContiguousKVCache(num_layers=1, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    keys = torch.ones(2, 5, 3)
+    values = torch.full((2, 5, 3), 2.0)
+    cache.append(layer_index=0, start_pos=0, new_keys=keys, new_values=values)
+    cached_keys, cached_values = cache.get(layer_index=0, end_pos=5)
+    assert torch.equal(cached_keys, keys)
+    assert torch.equal(cached_values, values)
+
+@pytest.mark.parametrize("layer_index,end_pos", [(-1, 1), (2, 1), (0, -1), (0, 0), (0, 6)])
+def test_contiguous_kv_cache_rejects_invalid_get_range(layer_index, end_pos):
+    cache = ContiguousKVCache(num_layers=2, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        cache.get(layer_index=layer_index, end_pos=end_pos)
+
+@pytest.mark.parametrize("layer_index,start_pos", [(-1, 0), (2, 0), (0, -1)])
+def test_contiguous_kv_cache_rejects_invalid_append_location(layer_index, start_pos):
+    cache = ContiguousKVCache(num_layers=2, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        cache.append(layer_index=layer_index, start_pos=start_pos, new_keys=torch.ones(2, 1, 3), new_values=torch.ones(2, 1, 3))
+
+def test_contiguous_kv_cache_rejects_capacity_overflow():
+    cache = ContiguousKVCache(num_layers=1, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, start_pos=4, new_keys=torch.ones(2, 2, 3), new_values=torch.ones(2, 2, 3))
+
+def test_contiguous_kv_cache_rejects_invalid_append_shapes():
+    cache = ContiguousKVCache(num_layers=1, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, start_pos=0, new_keys=torch.ones(1, 2, 1, 3), new_values=torch.ones(2, 1, 3))
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, start_pos=0, new_keys=torch.ones(2, 1, 3), new_values=torch.ones(2, 2, 3))
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, start_pos=0, new_keys=torch.ones(3, 1, 3), new_values=torch.ones(3, 1, 3))
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, start_pos=0, new_keys=torch.ones(2, 1, 4), new_values=torch.ones(2, 1, 4))
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, start_pos=0, new_keys=torch.empty(2, 0, 3), new_values=torch.empty(2, 0, 3))
+
+def test_contiguous_kv_cache_rejects_append_dtype_and_device_mismatch():
+    cache = ContiguousKVCache(num_layers=1, num_kv_heads=2, max_seq_length=5, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, start_pos=0, new_keys=torch.ones(2, 1, 3, dtype=torch.float64), new_values=torch.ones(2, 1, 3, dtype=torch.float64))
+    with pytest.raises(ValueError):
+        cache.append(layer_index=0, start_pos=0, new_keys=torch.ones(2, 1, 3, device="meta"), new_values=torch.ones(2, 1, 3, device="meta"))
+
+def test_kv_cache_manager_allocates_isolated_request_caches():
+    manager = KVCacheManager(num_layers=3, num_kv_heads=2, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
+    first_cache = manager.allocate("req-1", max_seq_length=8)
+    second_cache = manager.allocate("req-2", max_seq_length=12)
+    assert manager.caches == {"req-1": first_cache, "req-2": second_cache}
+    assert first_cache.max_seq_length == 8
+    assert second_cache.max_seq_length == 12
+    assert first_cache.key_cache.data_ptr() != second_cache.key_cache.data_ptr()
+    assert first_cache.value_cache.data_ptr() != second_cache.value_cache.data_ptr()
+    first_cache.key_cache[0, 0, 0, 0] = 1
+    first_cache.value_cache[0, 0, 0, 0] = 2
+    assert second_cache.key_cache[0, 0, 0, 0].item() == 0
+    assert second_cache.value_cache[0, 0, 0, 0].item() == 0
+
+def test_kv_cache_manager_rejects_duplicate_request_id():
+    manager = KVCacheManager(num_layers=3, num_kv_heads=2, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
+    manager.allocate("req-1", max_seq_length=8)
+    with pytest.raises(ValueError):
+        manager.allocate("req-1", max_seq_length=8)
+
+def test_kv_cache_manager_appends_to_requested_cache():
+    manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    first_cache = manager.allocate("req-1", max_seq_length=5)
+    second_cache = manager.allocate("req-2", max_seq_length=5)
+    keys = torch.ones(2, 2, 3)
+    values = torch.full((2, 2, 3), 2.0)
+    manager.append("req-1", layer_index=1, start_pos=0, new_keys=keys, new_values=values)
+    assert torch.equal(first_cache.key_cache[1, :, :2, :], keys)
+    assert torch.equal(first_cache.value_cache[1, :, :2, :], values)
+    assert torch.count_nonzero(second_cache.key_cache).item() == 0
+    assert torch.count_nonzero(second_cache.value_cache).item() == 0
+
+def test_kv_cache_manager_rejects_append_for_unknown_request():
+    manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        manager.append("unknown", layer_index=0, start_pos=0, new_keys=torch.ones(2, 1, 3), new_values=torch.ones(2, 1, 3))
+
+def test_kv_cache_manager_gets_requested_cache():
+    manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    manager.allocate("req-1", max_seq_length=5)
+    manager.allocate("req-2", max_seq_length=5)
+    first_keys = torch.ones(2, 2, 3)
+    first_values = torch.full((2, 2, 3), 2.0)
+    second_keys = torch.full((2, 2, 3), 3.0)
+    second_values = torch.full((2, 2, 3), 4.0)
+    manager.append("req-1", layer_index=1, start_pos=0, new_keys=first_keys, new_values=first_values)
+    manager.append("req-2", layer_index=1, start_pos=0, new_keys=second_keys, new_values=second_values)
+    cached_keys, cached_values = manager.get("req-2", layer_index=1, end_pos=2)
+    assert torch.equal(cached_keys, second_keys)
+    assert torch.equal(cached_values, second_values)
+
+def test_kv_cache_manager_rejects_get_for_unknown_request():
+    manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        manager.get("unknown", layer_index=0, end_pos=1)
+
+def test_kv_cache_manager_frees_only_requested_cache():
+    manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    first_cache = manager.allocate("req-1", max_seq_length=5)
+    second_cache = manager.allocate("req-2", max_seq_length=5)
+    second_cache.key_cache[0, 0, 0, 0] = 7
+    second_cache.value_cache[0, 0, 0, 0] = 8
+    assert manager.has_cache("req-1")
+    assert manager.has_cache("req-2")
+    manager.free("req-1")
+    assert not manager.has_cache("req-1")
+    assert manager.has_cache("req-2")
+    assert manager.caches == {"req-2": second_cache}
+    assert second_cache.key_cache[0, 0, 0, 0].item() == 7
+    assert second_cache.value_cache[0, 0, 0, 0].item() == 8
+    assert first_cache is not second_cache
+
+def test_kv_cache_manager_rejects_unknown_and_double_free():
+    manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        manager.free("unknown")
+    manager.allocate("req-1", max_seq_length=5)
+    manager.free("req-1")
+    with pytest.raises(ValueError):
+        manager.free("req-1")
+
+def test_kv_cache_manager_allows_request_id_reuse_after_free():
+    manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    first_cache = manager.allocate("req-1", max_seq_length=5)
+    manager.free("req-1")
+    second_cache = manager.allocate("req-1", max_seq_length=7)
+    assert second_cache is not first_cache
+    assert second_cache.max_seq_length == 7
+    assert manager.caches == {"req-1": second_cache}
+
+def test_kv_cache_manager_releases_cache_ownership():
+    manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    cache = manager.allocate("req-1", max_seq_length=5)
+    cache_reference = weakref.ref(cache)
+    manager.free("req-1")
+    del cache
+    gc.collect()
+    assert cache_reference() is None
+
+def test_kv_cache_manager_repeated_allocation_and_free():
+    manager = KVCacheManager(num_layers=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    cache_references = []
+    for index in range(100):
+        cache = manager.allocate(f"req-{index}", max_seq_length=5)
+        cache_references.append(weakref.ref(cache))
+        manager.free(f"req-{index}")
+        del cache
+    gc.collect()
+    assert manager.caches == {}
+    assert all(cache_reference() is None for cache_reference in cache_references)
+
+@pytest.mark.parametrize("num_layers,num_kv_heads,max_seq_length,head_dim", [(0, 2, 8, 4), (3, 0, 8, 4), (3, 2, 0, 4), (3, 2, 8, 0)])
+def test_contiguous_kv_cache_rejects_invalid_dimensions(num_layers, num_kv_heads, max_seq_length, head_dim):
+    with pytest.raises(ValueError):
+        ContiguousKVCache(num_layers=num_layers, num_kv_heads=num_kv_heads, max_seq_length=max_seq_length, head_dim=head_dim, device=torch.device("cpu"), dtype=torch.float32)
+
+@pytest.mark.parametrize("num_layers,num_kv_heads,head_dim", [(0, 2, 4), (3, 0, 4), (3, 2, 0)])
+def test_kv_cache_manager_rejects_invalid_dimensions(num_layers, num_kv_heads, head_dim):
+    with pytest.raises(ValueError):
+        KVCacheManager(num_layers=num_layers, num_kv_heads=num_kv_heads, head_dim=head_dim, device=torch.device("cpu"), dtype=torch.float32)
+
+def test_kv_cache_manager_rejects_invalid_max_sequence_length():
+    manager = KVCacheManager(num_layers=3, num_kv_heads=2, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        manager.allocate("req-1", max_seq_length=0)
