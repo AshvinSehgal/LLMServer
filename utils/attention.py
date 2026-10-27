@@ -17,7 +17,7 @@ class SelfAttention(nn.Module):
         self.head_dim = head_dim
         self.attention_scaling = attention_scaling
     
-    def forward(self, hidden_states, pos_embeddings, causal_mask, kv_cache_manager=None, layer_index=None, request_ids=None, start_pos=None, input_lens=None):
+    def forward(self, hidden_states, pos_embeddings, causal_mask, kv_cache=None, layer_index=None, request_ids=None, block_tables=None, start_pos=None, input_lens=None):
         Q = self.q_proj(hidden_states)
         K = self.k_proj(hidden_states)
         V = self.v_proj(hidden_states)
@@ -32,7 +32,7 @@ class SelfAttention(nn.Module):
         if self.n_query_heads % self.n_kv_heads != 0:
             raise ValueError(f"Number of query heads must be divisible by the number of KV heads: query heads: {self.n_query_heads}, KV heads: {self.n_kv_heads}")
         group_size = self.n_query_heads // self.n_kv_heads
-        if kv_cache_manager is None:
+        if kv_cache is None:
             K = torch.repeat_interleave(K, repeats=group_size, dim=1)
             V = torch.repeat_interleave(V, repeats=group_size, dim=1)
             attention_weights = torch.matmul(Q, K.mT) * self.attention_scaling
@@ -47,6 +47,7 @@ class SelfAttention(nn.Module):
             attention_scores = torch.zeros_like(Q)
             for batch_index in range(batch_size):
                 request_id = request_ids[batch_index]
+                request_block_table = block_tables[batch_index]
                 request_start_pos = start_pos[batch_index]
                 request_input_len = input_lens[batch_index]
                 if request_input_len <= 0 or request_input_len > seq_len:
@@ -55,8 +56,8 @@ class SelfAttention(nn.Module):
                 request_q = Q[batch_index:batch_index + 1, :, :request_input_len, :]
                 new_keys = K[batch_index, :, :request_input_len, :]
                 new_values = V[batch_index, :, :request_input_len, :]
-                kv_cache_manager.append(request_id, layer_index, request_start_pos, new_keys, new_values)
-                cached_keys, cached_values = kv_cache_manager.get(request_id, layer_index, request_end_pos)
+                kv_cache.append(layer_index, request_block_table, request_start_pos, new_keys, new_values)
+                cached_keys, cached_values = kv_cache.get(layer_index, request_block_table, request_end_pos)
                 cached_keys = cached_keys.unsqueeze(0)
                 cached_values = cached_values.unsqueeze(0)
                 cached_keys = torch.repeat_interleave(cached_keys, repeats=group_size, dim=1)

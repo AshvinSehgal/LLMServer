@@ -9,6 +9,7 @@ class PrefillBatch:
             raise ValueError(f"pad_token_id is required: {pad_token_id}")
         self.requests = requests
         self.request_ids = [request.request_id for request in self.requests]
+        self.block_tables = [request.block_table for request in self.requests]
         self.start_pos = [0 for request in self.requests]
         self.input_lens = [len(request.prompt_token_ids) for request in self.requests]
         self.pad_token_id = pad_token_id
@@ -35,6 +36,7 @@ class DecodeBatch:
         self.batch_size = len(requests)
         self.requests = requests
         self.request_ids = [request.request_id for request in self.requests]
+        self.block_tables = [request.block_table for request in self.requests]
         self.start_pos = [request.num_computed_tokens for request in self.requests]
         self.input_lens = [1 for request in self.requests]
         self.last_token_indices = torch.zeros(self.batch_size, device=device, dtype=torch.long)

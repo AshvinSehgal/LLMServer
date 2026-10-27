@@ -11,6 +11,8 @@ def test_prefill_batch():
     expected_attention_mask = torch.tensor([[[[0, mask_value, mask_value, mask_value], [0, 0, mask_value, mask_value], [0, 0, mask_value, mask_value], [0, 0, mask_value, mask_value]]], [[[0, mask_value, mask_value, mask_value], [0, 0, mask_value, mask_value], [0, 0, 0, mask_value], [0, 0, 0, 0]]]], dtype=torch.float32)
     assert batch.requests == requests
     assert batch.request_ids == ["req-1", "req-2"]
+    assert batch.block_tables[0] is requests[0].block_table
+    assert batch.block_tables[1] is requests[1].block_table
     assert batch.start_pos == [0, 0]
     assert batch.input_lens == [2, 4]
     assert batch.batch_size == 2
@@ -42,6 +44,8 @@ def test_decode_batch():
     expected_attention_mask = torch.tensor([[[[0, 0, 0, mask_value, mask_value, mask_value]]], [[[0, 0, 0, 0, 0, 0]]]], dtype=torch.float32)
     assert batch.requests == [first_request, second_request]
     assert batch.request_ids == ["req-1", "req-2"]
+    assert batch.block_tables[0] is first_request.block_table
+    assert batch.block_tables[1] is second_request.block_table
     assert batch.start_pos == [2, 5]
     assert batch.input_lens == [1, 1]
     assert batch.batch_size == 2

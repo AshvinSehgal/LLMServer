@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoModelForCausalLM
 from utils.attention import SelfAttention
-from utils.kv_cache import KVCacheManager
+from utils.kv_cache import PagedKVCache
 from utils.layers import RotaryEmbedding
 
 
@@ -60,18 +60,19 @@ def test_cached_self_attention_matches_full_attention():
     full_pos_ids = torch.arange(4).unsqueeze(0)
     full_pos_embeddings = rotary_embedding(full_hidden_states, full_pos_ids)
     full_mask = torch.full((1, 1, 4, 4), torch.finfo(torch.float32).min).triu(diagonal=1)
-    manager = KVCacheManager(num_layers=1, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
-    manager.allocate("req-1", max_seq_length=4)
+    cache = PagedKVCache(num_layers=1, num_blocks=2, block_size=3, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = []
     with torch.inference_mode():
         full_output = attention(full_hidden_states, full_pos_embeddings, full_mask)
         prefill_hidden_states = full_hidden_states[:, :3]
         prefill_pos_embeddings = rotary_embedding(prefill_hidden_states, full_pos_ids[:, :3])
-        prefill_output = attention(prefill_hidden_states, prefill_pos_embeddings, full_mask[:, :, :3, :3], kv_cache_manager=manager, layer_index=0, request_ids=["req-1"], start_pos=[0], input_lens=[3])
+        prefill_output = attention(prefill_hidden_states, prefill_pos_embeddings, full_mask[:, :, :3, :3], kv_cache=cache, layer_index=0, request_ids=["req-1"], block_tables=[block_table], start_pos=[0], input_lens=[3])
         decode_hidden_states = full_hidden_states[:, 3:]
         decode_pos_embeddings = rotary_embedding(decode_hidden_states, full_pos_ids[:, 3:])
-        decode_output = attention(decode_hidden_states, decode_pos_embeddings, torch.zeros(1, 1, 1, 4), kv_cache_manager=manager, layer_index=0, request_ids=["req-1"], start_pos=[3], input_lens=[1])
+        decode_output = attention(decode_hidden_states, decode_pos_embeddings, torch.zeros(1, 1, 1, 4), kv_cache=cache, layer_index=0, request_ids=["req-1"], block_tables=[block_table], start_pos=[3], input_lens=[1])
     torch.testing.assert_close(prefill_output, full_output[:, :3], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(decode_output, full_output[:, 3:], rtol=1e-5, atol=1e-5)
-    cached_keys, cached_values = manager.get("req-1", layer_index=0, end_pos=4)
+    cached_keys, cached_values = cache.get(layer_index=0, block_table=block_table, end_pos=4)
+    assert block_table == [0, 1]
     assert cached_keys.shape == (2, 4, 2)
     assert cached_values.shape == (2, 4, 2)

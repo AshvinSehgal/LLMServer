@@ -32,7 +32,10 @@ class Model(nn.Module):
 
     def forward(self, input_ids, pos_ids, attention_mask, **kwargs):
         self.inference_mode_by_call.append(torch.is_inference_mode_enabled())
-        self.calls.append({"input_shape": tuple(input_ids.shape), "request_ids": kwargs["request_ids"], "start_pos": kwargs["start_pos"], "input_lens": kwargs["input_lens"], "kv_cache_manager": kwargs["kv_cache_manager"]})
+        self.calls.append({"input_shape": tuple(input_ids.shape), "request_ids": kwargs["request_ids"], "block_tables": kwargs["block_tables"], "start_pos": kwargs["start_pos"], "input_lens": kwargs["input_lens"], "kv_cache_manager": kwargs["kv_cache_manager"]})
+        for block_table, start_pos, input_len in zip(kwargs["block_tables"], kwargs["start_pos"], kwargs["input_lens"]):
+            for token_pos in range(start_pos, start_pos + input_len):
+                kwargs["kv_cache_manager"].ensure_token_block(block_table, token_pos)
         token_ids = self.token_ids_by_call.pop(0)
         assert len(token_ids) == input_ids.shape[0]
         logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 100, device=input_ids.device)
@@ -88,9 +91,13 @@ def test_engine_prefill_batch_and_inference_mode():
     assert model.calls[0]["request_ids"] == [first_request.request_id, second_request.request_id]
     assert model.calls[0]["start_pos"] == [0, 0]
     assert model.calls[0]["input_lens"] == [2, 2]
-    assert model.calls[0]["kv_cache_manager"] is engine.kv_cache_manager
-    assert engine.kv_cache_manager.has_cache(first_request.request_id)
-    assert engine.kv_cache_manager.has_cache(second_request.request_id)
+    assert model.calls[0]["kv_cache_manager"] is engine.paged_kv_cache
+    assert model.calls[0]["block_tables"][0] is first_request.block_table
+    assert model.calls[0]["block_tables"][1] is second_request.block_table
+    assert first_request.block_table == [0]
+    assert second_request.block_table == [1]
+    assert engine.paged_kv_cache.num_allocated_blocks == 2
+    assert engine.kv_cache_manager.caches == {}
 
 def test_engine_decode_and_length_stopping_streams_incremental_text():
     model = Model(token_ids_by_call=[[50], [51]])
@@ -111,7 +118,9 @@ def test_engine_decode_and_length_stopping_streams_incremental_text():
     assert model.calls[1]["request_ids"] == [request.request_id]
     assert model.calls[1]["start_pos"] == [2]
     assert model.calls[1]["input_lens"] == [1]
-    assert not engine.kv_cache_manager.has_cache(request.request_id)
+    assert request.block_table == []
+    assert engine.paged_kv_cache.num_allocated_blocks == 0
+    assert engine.paged_kv_cache.num_free_blocks == engine.paged_kv_cache.num_blocks
 
 def test_engine_eos_stopping():
     model = Model(token_ids_by_call=[[2]], eos_token_id=[2, 3])
@@ -123,7 +132,8 @@ def test_engine_eos_stopping():
     assert request.finish_reason == RequestFinishReason.EOS
     assert request not in engine.scheduler.running
     assert request.output_queue.get_nowait() is None
-    assert not engine.kv_cache_manager.has_cache(request.request_id)
+    assert request.block_table == []
+    assert engine.paged_kv_cache.num_allocated_blocks == 0
 
 def test_engine_rejects_missing_bos_and_pad_token_ids():
     model = Model(token_ids_by_call=[], bos_token_id=None, pad_token_id=None)
@@ -228,7 +238,8 @@ def test_engine_cancels_running_request_and_clears_queued_output():
     assert request.status == RequestStatus.CANCELLED
     assert request.finish_reason == RequestFinishReason.CANCELLED
     assert request not in engine.scheduler.running
-    assert not engine.kv_cache_manager.has_cache(request.request_id)
+    assert request.block_table == []
+    assert engine.paged_kv_cache.num_allocated_blocks == 0
     assert request.output_queue.get_nowait() is None
     with pytest.raises(asyncio.QueueEmpty):
         request.output_queue.get_nowait()

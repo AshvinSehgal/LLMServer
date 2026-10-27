@@ -6,7 +6,7 @@ import torch
 from utils.scheduler import Scheduler
 from utils.request import Request, RequestStatus, RequestFinishReason, CompletedRequest
 from utils.batch import PrefillBatch, DecodeBatch
-from utils.kv_cache import KVCacheManager
+from utils.kv_cache import KVCacheManager, PagedKVCache
 
 STREAM_END = None
 
@@ -31,10 +31,21 @@ class Engine:
         self.scheduler = Scheduler(max_batch_size, max_num_batched_tokens)
         self.active_requests = {}
         self.completed_requests = OrderedDict()
+        self.num_blocks = 10
+        self.block_size = 10
         config = self.model.config
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.kv_cache_manager = KVCacheManager(
             num_layers=config.num_hidden_layers,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=head_dim,
+            device=self.device,
+            dtype=self.dtype
+        )
+        self.paged_kv_cache = PagedKVCache(
+            num_layers=config.num_hidden_layers,
+            num_blocks=self.num_blocks,
+            block_size=self.block_size,
             num_kv_heads=config.num_key_value_heads,
             head_dim=head_dim,
             device=self.device,
@@ -109,8 +120,7 @@ class Engine:
             request.output_queue.task_done()
     
     def release_request_resources(self, request):
-        if self.kv_cache_manager.has_cache(request.request_id):
-            self.kv_cache_manager.free(request.request_id)
+        self.paged_kv_cache.free_block_table(request.block_table)
     
     def cancel_request(self, request_id):
         self.prune_completed_requests()
@@ -136,8 +146,9 @@ class Engine:
             batch.input_ids, 
             batch.pos_ids, 
             batch.attention_mask,
-            kv_cache_manager=self.kv_cache_manager,
+            kv_cache_manager=self.paged_kv_cache,
             request_ids=batch.request_ids,
+            block_tables=batch.block_tables,
             start_pos=batch.start_pos,
             input_lens=batch.input_lens
             )
@@ -174,7 +185,6 @@ class Engine:
         prefill_requests = scheduler_output.prefill_requests
         for request in prefill_requests:
             max_seq_length = len(request.prompt_token_ids) + request.max_new_tokens
-            self.kv_cache_manager.allocate(request.request_id, max_seq_length)
         if prefill_requests:
             prefill_batch = PrefillBatch(prefill_requests, self.pad_token_id, self.device, self.dtype)
             next_token_ids = self.process_batch(prefill_batch)

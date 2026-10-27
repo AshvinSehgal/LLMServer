@@ -11,16 +11,17 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
         self.mlp = MLP(hidden_size, intermediate_size, bias)
     
-    def forward(self, hidden_states, pos_embeddings, causal_mask, kv_cache_manager=None, layer_index=None, request_ids=None, start_pos=None, input_lens=None):
+    def forward(self, hidden_states, pos_embeddings, causal_mask, kv_cache_manager=None, layer_index=None, request_ids=None, block_tables=None, start_pos=None, input_lens=None):
         residual = hidden_states
         normalized_hidden_states = self.input_layernorm(residual)
         attention_scores = self.self_attn(
             normalized_hidden_states, 
             pos_embeddings, 
             causal_mask, 
-            kv_cache_manager=kv_cache_manager, 
+            kv_cache=kv_cache_manager, 
             layer_index=layer_index, 
-            request_ids=request_ids, 
+            request_ids=request_ids,
+            block_tables=block_tables, 
             start_pos=start_pos, 
             input_lens=input_lens
             )
@@ -42,7 +43,7 @@ class Model(nn.Module):
         self.norm = RMSNorm(hidden_size, rms_norm_eps)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         
-    def forward(self, input_ids, pos_ids=None, causal_mask=None, kv_cache_manager=None, request_ids=None, start_pos=None, input_lens=None):
+    def forward(self, input_ids, pos_ids=None, causal_mask=None, kv_cache_manager=None, request_ids=None, block_tables=None, start_pos=None, input_lens=None):
         hidden_states = self.embed_tokens(input_ids)
         batch_size, seq_len = input_ids.shape
         if pos_ids is None:
@@ -60,6 +61,7 @@ class Model(nn.Module):
                 kv_cache_manager=kv_cache_manager,
                 layer_index=layer_index,
                 request_ids=request_ids,
+                block_tables=block_tables,
                 start_pos=start_pos,
                 input_lens=input_lens
                 )
