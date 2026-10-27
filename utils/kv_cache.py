@@ -87,19 +87,29 @@ class PagedKVCache:
         self.key_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
         self.value_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
         self.free_blocks = deque(range(self.num_blocks))
+        self.block_references = [0] * self.num_blocks
         self.num_free_blocks = self.num_blocks
         self.allocated_blocks = set()
         self.num_allocated_blocks = 0
+    
+    def retain_block(self, block_id):
+        if block_id < 0 or block_id >= self.num_blocks:
+            raise ValueError(f"Block id {block_id} is invalid, num_blocks is {self.num_blocks}")
+        if block_id not in self.allocated_blocks:
+            raise KVCacheStateError(f"Block {block_id} cannot be retained, it is not allocated")
+        self.block_references[block_id] += 1
     
     def free_block(self, block_id):
         if block_id < 0 or block_id >= self.num_blocks:
             raise ValueError(f"Block id {block_id} is invalid, num_blocks is {self.num_blocks}")
         if block_id not in self.allocated_blocks:
             raise KVCacheStateError(f"Block {block_id} cannot be freed, it is not allocated")
-        self.allocated_blocks.discard(block_id)
-        self.num_allocated_blocks -= 1
-        self.free_blocks.append(block_id)
-        self.num_free_blocks += 1
+        self.block_references[block_id] -= 1
+        if self.block_references[block_id] == 0:
+            self.allocated_blocks.discard(block_id)
+            self.num_allocated_blocks -= 1
+            self.free_blocks.append(block_id)
+            self.num_free_blocks += 1
     
     def free_block_table(self, block_table):
         unique_blocks = set()
@@ -120,6 +130,7 @@ class PagedKVCache:
         self.num_free_blocks -= 1
         self.allocated_blocks.add(free_cache_block)
         self.num_allocated_blocks += 1
+        self.block_references[free_cache_block] = 1
         return free_cache_block
     
     def get_token_location(self, block_table, token_pos):
