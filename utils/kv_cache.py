@@ -1,5 +1,6 @@
 import torch
 from collections import deque
+import math
 class ContiguousKVCache:
     def __init__(self, num_layers, num_kv_heads, max_seq_length, head_dim, device, dtype):
         if num_layers <= 0:
@@ -100,6 +101,18 @@ class PagedKVCache:
         self.free_blocks.append(block_id)
         self.num_free_blocks += 1
     
+    def free_block_table(self, block_table):
+        unique_blocks = set()
+        for block_id in block_table:
+            if block_id not in self.allocated_blocks:
+                raise KVCacheStateError(f"Block {block_id} cannot be freed, it is not allocated")
+            if block_id in unique_blocks:
+                raise ValueError(f"Duplicate block id {block_id} found")
+            unique_blocks.add(block_id)
+        for block_id in block_table:
+            self.free_block(block_id)
+        block_table.clear()
+    
     def allocate_block(self):
         if not self.free_blocks:
             raise KVCacheExhaustedError(f"KV Cache is out of blocks: num_blocks: {self.num_blocks}, num_free_blocks: {self.num_free_blocks}")
@@ -164,7 +177,27 @@ class PagedKVCache:
             self.key_cache[layer_index, physical_block, block_offset, :, :] = new_keys[:, new_token_index, :]
             self.value_cache[layer_index, physical_block, block_offset, :, :] = new_values[:, new_token_index, :]
         
-
+    def get(self, layer_index, block_table, end_pos):
+        if layer_index < 0 or layer_index >= self.num_layers:
+            raise IndexError(f"Invalid layer index: {layer_index}, num_layers: {self.num_layers}")
+        if end_pos <= 0:
+            raise ValueError(f"end_pos must be positive: {end_pos}")
+        num_reqd_blocks = math.ceil(end_pos / self.block_size)
+        if num_reqd_blocks > len(block_table):
+            raise IndexError(f"Number of blocks required {num_reqd_blocks} is more than the block table has")
+        keys = []
+        values = []
+        for i in range(num_reqd_blocks):
+            physical_block = block_table[i]
+            if physical_block not in self.allocated_blocks:
+                raise KVCacheStateError(f"Block {physical_block} is not an allocated block")
+            tokens_from_block = min(self.block_size, end_pos - (i * self.block_size))
+            key_piece = self.key_cache[layer_index, physical_block, :tokens_from_block].permute(1, 0, 2)
+            value_piece = self.value_cache[layer_index, physical_block, :tokens_from_block].permute(1, 0, 2)
+            keys.append(key_piece)
+            values.append(value_piece)
+        return torch.cat(keys, dim=1), torch.cat(values, dim=1)
+            
 
 class KVCacheManager:
     def __init__(self, num_layers, num_kv_heads, head_dim, device, dtype):
