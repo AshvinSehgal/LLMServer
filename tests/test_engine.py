@@ -8,13 +8,16 @@ from utils.engine import Engine
 from utils.request import RequestFinishReason, RequestStatus
 
 class Tokenizer:
-    def __init__(self, bos_token_id, pad_token_id=4, eos_token_id=2):
+    def __init__(self, bos_token_id, pad_token_id=4, eos_token_id=2, prompt_token_ids=None):
         self.bos_token_id = bos_token_id
         self.pad_token_id = pad_token_id
         self.eos_token_id = eos_token_id
+        self.prompt_token_ids = prompt_token_ids or [10, 11]
 
     def __call__(self, prompt):
-        return {"input_ids": [10, 11]}
+        if isinstance(self.prompt_token_ids, dict):
+            return {"input_ids": self.prompt_token_ids[prompt]}
+        return {"input_ids": self.prompt_token_ids}
 
     def decode(self, token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False):
         decoded_tokens = {2: "", 50: "Hel", 51: "lo", 60: "World"}
@@ -32,7 +35,7 @@ class Model(nn.Module):
 
     def forward(self, input_ids, pos_ids, attention_mask, **kwargs):
         self.inference_mode_by_call.append(torch.is_inference_mode_enabled())
-        self.calls.append({"input_shape": tuple(input_ids.shape), "request_ids": kwargs["request_ids"], "block_tables": kwargs["block_tables"], "start_pos": kwargs["start_pos"], "input_lens": kwargs["input_lens"], "kv_cache_manager": kwargs["kv_cache_manager"]})
+        self.calls.append({"input_shape": tuple(input_ids.shape), "input_ids": input_ids.tolist(), "pos_ids": pos_ids.tolist(), "request_ids": kwargs["request_ids"], "block_tables": kwargs["block_tables"], "start_pos": kwargs["start_pos"], "input_lens": kwargs["input_lens"], "kv_cache_manager": kwargs["kv_cache_manager"]})
         for block_table, start_pos, input_len in zip(kwargs["block_tables"], kwargs["start_pos"], kwargs["input_lens"]):
             for token_pos in range(start_pos, start_pos + input_len):
                 kwargs["kv_cache_manager"].ensure_token_block(block_table, token_pos)
@@ -208,10 +211,69 @@ def test_engine_token_budget_limits_prefill_admission():
     assert engine.scheduler.running == [first_request]
     assert list(engine.scheduler.waiting) == [second_request]
 
-def test_engine_rejects_prompt_larger_than_token_budget():
-    engine = Engine(model=Model(token_ids_by_call=[]), tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=3, max_batch_size=1, max_num_batched_tokens=1)
-    with pytest.raises(ValueError):
-        engine.add_request("Hello")
+def test_engine_chunks_prompt_larger_than_token_budget():
+    model = Model(token_ids_by_call=[[50], [50]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=1)
+    request = engine.add_request("Hello")
+    assert engine.step()
+    assert request.num_computed_tokens == 1
+    assert request.status == RequestStatus.PREFILL
+    assert request.generated_token_ids == []
+    assert request.output_queue.empty()
+    assert not engine.step()
+    assert request.num_computed_tokens == 2
+    assert request.generated_token_ids == [50]
+    assert request.status == RequestStatus.FINISHED
+    assert [call["start_pos"] for call in model.calls] == [[0], [1]]
+
+def test_engine_streams_only_after_final_prefill_chunk():
+    model = Model(token_ids_by_call=[[60], [60], [50], [51]])
+    tokenizer = Tokenizer(bos_token_id=3, prompt_token_ids=list(range(10, 18)))
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=2, max_batch_size=1, max_num_batched_tokens=3, prefill_chunk_size=3)
+    request = engine.add_request("Long prompt")
+    for expected_count in (3, 6):
+        assert engine.step()
+        assert request.num_computed_tokens == expected_count
+        assert request.status == RequestStatus.PREFILL
+        assert request.generated_token_ids == []
+        assert request.output_queue.empty()
+    assert engine.step()
+    assert request.num_computed_tokens == 8
+    assert request.status == RequestStatus.DECODING
+    assert request.generated_token_ids == [50]
+    assert request.output_queue.get_nowait() == "Hel"
+    assert [call["input_ids"] for call in model.calls] == [[[10, 11, 12]], [[13, 14, 15]], [[16, 17]]]
+    assert [call["pos_ids"] for call in model.calls] == [[[0, 1, 2]], [[3, 4, 5]], [[6, 7]]]
+    assert [call["start_pos"] for call in model.calls] == [[0], [3], [6]]
+    assert [call["input_lens"] for call in model.calls] == [[3], [3], [2]]
+    assert not engine.step()
+    assert request.generated_token_ids == [50, 51]
+    assert request.status == RequestStatus.FINISHED
+    assert request.output_queue.get_nowait() == "lo"
+    assert request.output_queue.get_nowait() is None
+    assert request.block_table == []
+
+def test_engine_samples_only_finished_prefill_rows_in_mixed_batch():
+    model = Model(token_ids_by_call=[[50, 60], [60], [51]])
+    tokenizer = Tokenizer(bos_token_id=3, prompt_token_ids={"Short": [10, 11], "Long": [20, 21, 22, 23]})
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=2, max_batch_size=2, max_num_batched_tokens=4, prefill_chunk_size=2)
+    short_request = engine.add_request("Short")
+    long_request = engine.add_request("Long")
+    assert engine.step()
+    assert short_request.generated_token_ids == [50]
+    assert short_request.status == RequestStatus.DECODING
+    assert long_request.generated_token_ids == []
+    assert long_request.status == RequestStatus.PREFILL
+    assert long_request.num_computed_tokens == 2
+    assert long_request.output_queue.empty()
+    assert engine.step()
+    assert short_request.generated_token_ids == [50, 51]
+    assert long_request.generated_token_ids == [60]
+    assert long_request.num_computed_tokens == 4
+    assert model.calls[1]["request_ids"] == [long_request.request_id]
+    assert model.calls[1]["start_pos"] == [2]
+    assert model.calls[2]["request_ids"] == [short_request.request_id]
+    assert model.calls[2]["start_pos"] == [2]
 
 def test_engine_cancels_waiting_request():
     engine = Engine(model=Model(token_ids_by_call=[]), tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=3, max_batch_size=1, max_num_batched_tokens=2)

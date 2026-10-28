@@ -28,13 +28,42 @@ def test_prefill_batch_rejects_empty_requests():
     with pytest.raises(ValueError):
         PrefillBatch(requests=[], pad_token_id=99, device=torch.device("cpu"), dtype=torch.float32)
 
+def test_prefill_batch_uses_chunk_slices_and_absolute_positions():
+    first_request = Request("req-1", "", [10, 11, 12, 13, 14], 20, asyncio.Queue())
+    second_request = Request("req-2", "", [20, 21, 22], 20, asyncio.Queue())
+    first_request.start_prefill()
+    first_request.advance_prefill(3)
+    second_request.start_prefill()
+    second_request.advance_prefill(1)
+    batch = PrefillBatch([first_request, second_request], pad_token_id=99, device=torch.device("cpu"), dtype=torch.float32, chunk_lengths=[2, 1])
+    mask_value = torch.finfo(torch.float32).min
+    assert batch.start_pos == [3, 1]
+    assert batch.end_pos == [5, 2]
+    assert batch.input_lens == [2, 1]
+    assert torch.equal(batch.input_ids, torch.tensor([[13, 14], [21, 99]]))
+    assert torch.equal(batch.pos_ids, torch.tensor([[3, 4], [1, 0]]))
+    assert torch.equal(batch.last_token_indices, torch.tensor([1, 0]))
+    assert torch.equal(batch.attention_mask[0, 0], torch.tensor([[0, 0, 0, 0, mask_value], [0, 0, 0, 0, 0]]))
+    assert torch.equal(batch.attention_mask[1, 0], torch.tensor([[0, 0, mask_value, mask_value, mask_value], [0, 0, mask_value, mask_value, mask_value]]))
+
+def test_prefill_batch_rejects_invalid_chunk_lengths():
+    request = Request("req-1", "", [10, 11], 20, asyncio.Queue())
+    with pytest.raises(ValueError):
+        PrefillBatch([request], pad_token_id=99, device=torch.device("cpu"), dtype=torch.float32, chunk_lengths=[])
+    with pytest.raises(ValueError):
+        PrefillBatch([request], pad_token_id=99, device=torch.device("cpu"), dtype=torch.float32, chunk_lengths=[0])
+    with pytest.raises(ValueError):
+        PrefillBatch([request], pad_token_id=99, device=torch.device("cpu"), dtype=torch.float32, chunk_lengths=[3])
+
 def test_decode_batch():
     first_request = Request("req-1", "A B", [10, 11], 20, asyncio.Queue())
     second_request = Request("req-2", "C D E F", [20, 21, 22, 23], 20, asyncio.Queue())
     first_request.start_prefill()
+    first_request.advance_prefill(2)
     first_request.complete_prefill()
     first_request.append_generated_token(50)
     second_request.start_prefill()
+    second_request.advance_prefill(4)
     second_request.complete_prefill()
     second_request.append_generated_token(60)
     second_request.complete_decode()

@@ -12,7 +12,7 @@ from utils.kv_cache import PagedKVCache, KVCacheExhaustedError
 STREAM_END = None
 
 class Engine:
-    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600):
+    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600, prefill_chunk_size=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = next(model.parameters()).device
@@ -29,7 +29,7 @@ class Engine:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_completed_requests = max_completed_requests
         self.completed_request_ttl = timedelta(seconds=completed_request_ttl_seconds)
-        self.scheduler = Scheduler(max_batch_size, max_num_batched_tokens)
+        self.scheduler = Scheduler(max_batch_size, max_num_batched_tokens, prefill_chunk_size)
         self.active_requests = {}
         self.completed_requests = OrderedDict()
         self.num_blocks = 500
@@ -79,8 +79,6 @@ class Engine:
             prompt_token_ids = [self.bos_token_id]
         else:
             prompt_token_ids = self.tokenizer(prompt)["input_ids"]
-        if len(prompt_token_ids) > self.max_num_batched_tokens:
-            raise ValueError(f"Prompt is too large to process: prompt tokens: {len(prompt_token_ids)}, max_num_batched_tokens: {self.max_num_batched_tokens}")
         request_id = f"req-{uuid.uuid4()}"
         output_queue = asyncio.Queue()
         request = Request(request_id, prompt, prompt_token_ids, self.max_new_tokens, output_queue)
@@ -136,7 +134,7 @@ class Engine:
     
     @torch.inference_mode()
     def process_batch(self, batch):
-        logits = self.model(
+        return self.model(
             batch.input_ids, 
             batch.pos_ids, 
             batch.attention_mask,
@@ -146,6 +144,8 @@ class Engine:
             start_pos=batch.start_pos,
             input_lens=batch.input_lens
             )
+
+    def sample_batch(self, logits, batch):
         last_real_logits = logits[torch.arange(batch.batch_size, device=logits.device), batch.last_token_indices]
         next_token_ids = torch.argmax(last_real_logits, dim=-1)
         return next_token_ids.tolist()
@@ -177,21 +177,28 @@ class Engine:
         scheduler_output = self.scheduler.schedule()
         decode_requests = scheduler_output.decode_requests
         prefill_requests = scheduler_output.prefill_requests
+        num_blocks_needed = sum(max(0, math.ceil((request.num_computed_tokens + chunk_len) / self.kv_cache.block_size) - len(request.block_table)) for request, chunk_len in zip(prefill_requests, scheduler_output.prefill_token_counts))
+        num_blocks_needed += sum(max(0, math.ceil((request.num_computed_tokens + 1) / self.kv_cache.block_size) - len(request.block_table)) for request in decode_requests)
+        if num_blocks_needed > self.kv_cache.num_free_blocks:
+            raise KVCacheExhaustedError(f"Required blocks {num_blocks_needed} in KV cache exceeds currently free blocks")
         if prefill_requests:
-            num_blocks_needed = sum([math.ceil(len(request.prompt_token_ids) / self.kv_cache.block_size) for request in prefill_requests])
-            if num_blocks_needed > self.kv_cache.num_free_blocks:
-                raise KVCacheExhaustedError(f"Required blocks {num_blocks_needed} in KV cache exceeds currently free blocks")
-            prefill_batch = PrefillBatch(prefill_requests, self.pad_token_id, self.device, self.dtype)
-            next_token_ids = self.process_batch(prefill_batch)
-            for request, token_id in zip(prefill_requests, next_token_ids):
-                request.complete_prefill()
-                self.accept_generated_token(request, token_id)
+            prefill_batch = PrefillBatch(prefill_requests, self.pad_token_id, self.device, self.dtype, chunk_lengths=scheduler_output.prefill_token_counts)
+            logits = self.process_batch(prefill_batch)
+            final_rows = []
+            for row, (request, chunk_len) in enumerate(zip(prefill_requests, scheduler_output.prefill_token_counts)):
+                request.advance_prefill(chunk_len)
+                if request.num_computed_tokens == len(request.prompt_token_ids):
+                    request.complete_prefill()
+                    final_rows.append(row)
+            if final_rows:
+                final_logits = logits[final_rows, prefill_batch.last_token_indices[final_rows]]
+                next_token_ids = torch.argmax(final_logits, dim=-1).tolist()
+                for row, token_id in zip(final_rows, next_token_ids):
+                    self.accept_generated_token(prefill_requests[row], token_id)
         if decode_requests:
-            num_blocks_needed = len(decode_requests)
-            if num_blocks_needed > self.kv_cache.num_free_blocks:
-                raise KVCacheExhaustedError(f"Required blocks {num_blocks_needed} in KV cache exceeds currently free blocks")
             decode_batch = DecodeBatch(decode_requests, self.device, self.dtype)
-            next_token_ids = self.process_batch(decode_batch)
+            logits = self.process_batch(decode_batch)
+            next_token_ids = self.sample_batch(logits, decode_batch)
             for request, token_id in zip(decode_requests, next_token_ids):
                 request.complete_decode()
                 self.accept_generated_token(request, token_id)

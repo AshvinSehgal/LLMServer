@@ -24,6 +24,10 @@ def test_request_lifecycle():
     request = Request("req-1", "Hello", [10, 11], 20, asyncio.Queue())
     request.start_prefill()
     assert request.status == RequestStatus.PREFILL
+    request.advance_prefill(1)
+    assert request.num_computed_tokens == 1
+    assert request.status == RequestStatus.PREFILL
+    request.advance_prefill(1)
     request.complete_prefill()
     assert request.status == RequestStatus.DECODING
     assert request.num_computed_tokens == 2
@@ -46,6 +50,13 @@ def test_request_rejects_invalid_transitions():
         request.append_generated_token(50)
     with pytest.raises(RequestStateError):
         request.complete_decode()
+    request.start_prefill()
+    with pytest.raises(RequestStateError):
+        request.complete_prefill()
+    with pytest.raises(ValueError):
+        request.advance_prefill(0)
+    with pytest.raises(ValueError):
+        request.advance_prefill(2)
 
 def test_request_cancellation():
     request = Request("req-1", "Hello", [9707], 20, asyncio.Queue())

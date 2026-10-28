@@ -61,12 +61,21 @@ class Request:
         if self.status != RequestStatus.WAITING:
             raise RequestStateError(f"Request cannot be put for prefill, current request status is {self.status.value}")
         self.status = RequestStatus.PREFILL
+
+    def advance_prefill(self, num_tokens):
+        if self.status != RequestStatus.PREFILL:
+            raise RequestStateError(f"Request prefill cannot advance, current request status is {self.status.value}")
+        remaining_prompt = len(self.prompt_token_ids) - self.num_computed_tokens
+        if num_tokens <= 0 or num_tokens > remaining_prompt:
+            raise ValueError(f"Invalid number of prefill tokens: num_tokens: {num_tokens}, remaining_prompt: {remaining_prompt}")
+        self.num_computed_tokens += num_tokens
     
     def complete_prefill(self):
         if self.status != RequestStatus.PREFILL:
             raise RequestStateError(f"Request prefill cannot be completed, current request status is {self.status.value}")
+        if self.num_computed_tokens != len(self.prompt_token_ids):
+            raise RequestStateError(f"Request prefill cannot be completed before all prompt tokens are computed: num_computed_tokens: {self.num_computed_tokens}, prompt_tokens: {len(self.prompt_token_ids)}")
         self.status = RequestStatus.DECODING
-        self.num_computed_tokens = len(self.prompt_token_ids)
         
     def append_generated_token(self, token_id):
         if self.status != RequestStatus.DECODING:
