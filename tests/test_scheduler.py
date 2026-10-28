@@ -55,6 +55,23 @@ def test_scheduler_token_budget_includes_decode_and_prefill_tokens():
     assert scheduler.running == [decode_request, first_waiting_request]
     assert list(scheduler.waiting) == [second_waiting_request]
 
+def test_scheduler_counts_only_uncomputed_prompt_tokens():
+    scheduler = Scheduler(max_batch_size=2, max_num_batched_tokens=4)
+    decode_request = create_request("req-decode")
+    decode_request.start_prefill()
+    decode_request.complete_prefill()
+    partial_request = create_request("req-partial", [10, 11, 12, 13, 14])
+    partial_request.num_computed_tokens = 2
+    scheduler.running.append(decode_request)
+    scheduler.waiting.append(partial_request)
+    output = scheduler.schedule()
+    assert output.decode_requests == [decode_request]
+    assert output.prefill_requests == [partial_request]
+    assert output.num_scheduled_tokens == 4
+    assert partial_request.status == RequestStatus.PREFILL
+    assert scheduler.running == [decode_request, partial_request]
+    assert list(scheduler.waiting) == []
+
 def test_scheduler_rejects_invalid_token_budget():
     with pytest.raises(ValueError):
         Scheduler(max_batch_size=2, max_num_batched_tokens=0)

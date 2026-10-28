@@ -22,7 +22,7 @@ class Scheduler:
         remaining_tokens = self.max_num_batched_tokens - used_tokens
         while self.waiting and available_slots > 0:
             request = self.waiting[0]
-            prompt_cost = len(request.prompt_token_ids)
+            prompt_cost = len(request.prompt_token_ids) - request.num_computed_tokens
             if prompt_cost > self.max_num_batched_tokens:
                 raise ValueError(f"Prompt is too large to process: prompt tokens: {prompt_cost}, max_num_batched_tokens: {self.max_num_batched_tokens}")
             if prompt_cost > remaining_tokens:
