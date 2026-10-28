@@ -6,11 +6,16 @@ from utils.scheduler import Scheduler, SchedulerOutput
 def create_request(request_id, prompt_token_ids=None):
     return Request(request_id, "Hello", prompt_token_ids or [9707], 20, asyncio.Queue())
 
+def schedule_and_commit(scheduler):
+    output = scheduler.plan()
+    scheduler.commit(output)
+    return output
+
 def test_scheduler():
     scheduler = Scheduler(max_batch_size=2, max_num_batched_tokens=2)
     requests = [create_request(f"req-{index}") for index in range(3)]
     scheduler.waiting.extend(requests)
-    first_output = scheduler.schedule()
+    first_output = schedule_and_commit(scheduler)
     assert isinstance(first_output, SchedulerOutput)
     assert first_output.prefill_requests == requests[:2]
     assert first_output.prefill_token_counts == [1, 1]
@@ -24,14 +29,14 @@ def test_scheduler():
     for request in requests[:2]:
         request.advance_prefill(1)
         request.complete_prefill()
-    second_output = scheduler.schedule()
+    second_output = schedule_and_commit(scheduler)
     assert second_output.prefill_requests == []
     assert second_output.decode_requests == requests[:2]
     assert second_output.num_scheduled_tokens == 2
     assert scheduler.running == requests[:2]
     assert list(scheduler.waiting) == requests[2:]
     scheduler.running.remove(requests[0])
-    third_output = scheduler.schedule()
+    third_output = schedule_and_commit(scheduler)
     assert third_output.prefill_requests == [requests[2]]
     assert third_output.prefill_token_counts == [1]
     assert third_output.decode_requests == [requests[1]]
@@ -54,7 +59,7 @@ def test_scheduler_token_budget_includes_decode_and_prefill_tokens():
     second_waiting_request = create_request("req-second", [20, 21])
     scheduler.running.append(decode_request)
     scheduler.waiting.extend([first_waiting_request, second_waiting_request])
-    output = scheduler.schedule()
+    output = schedule_and_commit(scheduler)
     assert output.decode_requests == [decode_request]
     assert output.prefill_requests == [first_waiting_request, second_waiting_request]
     assert output.prefill_token_counts == [3, 1]
@@ -72,7 +77,7 @@ def test_scheduler_counts_only_uncomputed_prompt_tokens():
     partial_request.num_computed_tokens = 2
     scheduler.running.append(decode_request)
     scheduler.waiting.append(partial_request)
-    output = scheduler.schedule()
+    output = schedule_and_commit(scheduler)
     assert output.decode_requests == [decode_request]
     assert output.prefill_requests == [partial_request]
     assert output.prefill_token_counts == [3]
@@ -93,12 +98,12 @@ def test_scheduler_chunks_prompt_larger_than_token_budget():
     scheduler = Scheduler(max_batch_size=1, max_num_batched_tokens=3)
     request = create_request("req-large", [10, 11, 12, 13])
     scheduler.waiting.append(request)
-    first_output = scheduler.schedule()
+    first_output = schedule_and_commit(scheduler)
     assert first_output.prefill_requests == [request]
     assert first_output.prefill_token_counts == [3]
     assert first_output.num_scheduled_tokens == 3
     request.advance_prefill(3)
-    second_output = scheduler.schedule()
+    second_output = schedule_and_commit(scheduler)
     assert second_output.prefill_requests == [request]
     assert second_output.prefill_token_counts == [1]
     assert second_output.num_scheduled_tokens == 1
@@ -108,13 +113,29 @@ def test_scheduler_reschedules_running_prefill_without_using_another_slot():
     first_request = create_request("req-first", [10, 11, 12, 13, 14])
     second_request = create_request("req-second", [20, 21, 22, 23, 24])
     scheduler.waiting.extend([first_request, second_request])
-    first_output = scheduler.schedule()
+    first_output = schedule_and_commit(scheduler)
     assert first_output.prefill_requests == [first_request, second_request]
     assert first_output.prefill_token_counts == [2, 2]
     first_request.advance_prefill(2)
     second_request.advance_prefill(2)
-    second_output = scheduler.schedule()
+    second_output = schedule_and_commit(scheduler)
     assert second_output.prefill_requests == [first_request, second_request]
     assert second_output.prefill_token_counts == [2, 2]
     assert second_output.num_scheduled_tokens == 4
     assert scheduler.running == [first_request, second_request]
+
+def test_scheduler_plan_does_not_mutate_requests():
+    scheduler = Scheduler(max_batch_size=2, max_num_batched_tokens=2)
+    requests = [create_request("req-1"), create_request("req-2")]
+    scheduler.waiting.extend(requests)
+    output = scheduler.plan()
+    assert output.prefill_requests == requests
+    assert output.prefill_token_counts == [1, 1]
+    assert output.num_admitted_requests == 2
+    assert list(scheduler.waiting) == requests
+    assert scheduler.running == []
+    assert all(request.status == RequestStatus.WAITING for request in requests)
+    scheduler.commit(output)
+    assert list(scheduler.waiting) == []
+    assert scheduler.running == requests
+    assert all(request.status == RequestStatus.PREFILL for request in requests)

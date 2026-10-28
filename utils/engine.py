@@ -173,39 +173,64 @@ class Engine:
         self.stream_output(request)
         self.check_stopping(request, token_id)
     
-    def step(self):
-        scheduler_output = self.scheduler.schedule()
+    def process_decode_batch(self, scheduler_output):
+        if not scheduler_output.decode_requests:
+            return
+        decode_batch = DecodeBatch(scheduler_output.decode_requests, self.device, self.dtype)
+        logits = self.process_batch(decode_batch)
+        next_token_ids = self.sample_batch(logits, decode_batch)
+        for request, token_id in zip(scheduler_output.decode_requests, next_token_ids):
+            request.complete_decode()
+            self.accept_generated_token(request, token_id)
+
+    def process_prefill_batch(self, scheduler_output):
+        prefill_work = [(request, chunk_len) for request, chunk_len in zip(scheduler_output.prefill_requests, scheduler_output.prefill_token_counts) if request.status == RequestStatus.PREFILL]
+        if not prefill_work:
+            return
+        prefill_requests = [request for request, _ in prefill_work]
+        chunk_lengths = [chunk_len for _, chunk_len in prefill_work]
+        prefill_batch = PrefillBatch(prefill_requests, self.pad_token_id, self.device, self.dtype, chunk_lengths=chunk_lengths)
+        logits = self.process_batch(prefill_batch)
+        final_rows = []
+        for row, (request, chunk_len) in enumerate(prefill_work):
+            request.advance_prefill(chunk_len)
+            if request.num_computed_tokens == len(request.prompt_token_ids):
+                request.complete_prefill()
+                final_rows.append(row)
+        if final_rows:
+            final_logits = logits[final_rows, prefill_batch.last_token_indices[final_rows]]
+            next_token_ids = torch.argmax(final_logits, dim=-1).tolist()
+            for row, token_id in zip(final_rows, next_token_ids):
+                self.accept_generated_token(prefill_requests[row], token_id)
+
+    def remove_finished_and_cancelled_requests(self):
+        self.scheduler.running[:] = [request for request in self.scheduler.running if request.status not in (RequestStatus.FINISHED, RequestStatus.CANCELLED)]
+
+    def schedule_step(self):
+        scheduler_output = self.scheduler.plan()
         decode_requests = scheduler_output.decode_requests
         prefill_requests = scheduler_output.prefill_requests
         num_blocks_needed = sum(max(0, math.ceil((request.num_computed_tokens + chunk_len) / self.kv_cache.block_size) - len(request.block_table)) for request, chunk_len in zip(prefill_requests, scheduler_output.prefill_token_counts))
         num_blocks_needed += sum(max(0, math.ceil((request.num_computed_tokens + 1) / self.kv_cache.block_size) - len(request.block_table)) for request in decode_requests)
         if num_blocks_needed > self.kv_cache.num_free_blocks:
             raise KVCacheExhaustedError(f"Required blocks {num_blocks_needed} in KV cache exceeds currently free blocks")
-        if prefill_requests:
-            prefill_batch = PrefillBatch(prefill_requests, self.pad_token_id, self.device, self.dtype, chunk_lengths=scheduler_output.prefill_token_counts)
-            logits = self.process_batch(prefill_batch)
-            final_rows = []
-            for row, (request, chunk_len) in enumerate(zip(prefill_requests, scheduler_output.prefill_token_counts)):
-                request.advance_prefill(chunk_len)
-                if request.num_computed_tokens == len(request.prompt_token_ids):
-                    request.complete_prefill()
-                    final_rows.append(row)
-            if final_rows:
-                final_logits = logits[final_rows, prefill_batch.last_token_indices[final_rows]]
-                next_token_ids = torch.argmax(final_logits, dim=-1).tolist()
-                for row, token_id in zip(final_rows, next_token_ids):
-                    self.accept_generated_token(prefill_requests[row], token_id)
-        if decode_requests:
-            decode_batch = DecodeBatch(decode_requests, self.device, self.dtype)
-            logits = self.process_batch(decode_batch)
-            next_token_ids = self.sample_batch(logits, decode_batch)
-            for request, token_id in zip(decode_requests, next_token_ids):
-                request.complete_decode()
-                self.accept_generated_token(request, token_id)
-        self.scheduler.running[:] = [request for request in self.scheduler.running if request.status not in (RequestStatus.FINISHED, RequestStatus.CANCELLED)]
+        self.scheduler.commit(scheduler_output)
+        return scheduler_output
+
+    def step(self):
+        scheduler_output = self.schedule_step()
+        self.process_decode_batch(scheduler_output)
+        self.remove_finished_and_cancelled_requests()
+        self.process_prefill_batch(scheduler_output)
+        self.remove_finished_and_cancelled_requests()
         return bool(self.scheduler.waiting or self.scheduler.running)
     
     async def run(self):
         while self.scheduler.waiting or self.scheduler.running:
-            self.step()
+            scheduler_output = self.schedule_step()
+            self.process_decode_batch(scheduler_output)
+            self.remove_finished_and_cancelled_requests()
+            await asyncio.sleep(0)
+            self.process_prefill_batch(scheduler_output)
+            self.remove_finished_and_cancelled_requests()
             await asyncio.sleep(0)

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import pytest
 from utils.engine import Engine
+from utils.kv_cache import PagedKVCache, KVCacheExhaustedError
 from utils.request import RequestFinishReason, RequestStatus
 
 class Tokenizer:
@@ -180,8 +181,45 @@ async def test_engine_run_accepts_request_between_steps():
     assert engine.scheduler.running == []
     assert list(engine.scheduler.waiting) == []
 
+@pytest.mark.asyncio
+async def test_engine_run_yields_decode_output_before_prefill():
+    model = Model(token_ids_by_call=[[50], [51], [60], [51]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=2, max_batch_size=2, max_num_batched_tokens=4)
+    decode_request = engine.add_request("Decode")
+    assert engine.step()
+    assert decode_request.output_queue.get_nowait() == "Hel"
+    prefill_request = engine.add_request("Prefill")
+    async def consume_decode_output():
+        assert await decode_request.output_queue.get() == "lo"
+        assert len(model.calls) == 2
+        assert prefill_request.generated_token_ids == []
+    consumer_task = asyncio.create_task(consume_decode_output())
+    await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(consumer_task, engine.run()), timeout=5)
+    assert [call["request_ids"] for call in model.calls] == [[decode_request.request_id], [decode_request.request_id], [prefill_request.request_id], [prefill_request.request_id]]
+
+@pytest.mark.asyncio
+async def test_engine_run_skips_prefill_cancelled_during_yield():
+    model = Model(token_ids_by_call=[[50], [51]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=2, max_batch_size=2, max_num_batched_tokens=4)
+    decode_request = engine.add_request("Decode")
+    assert engine.step()
+    assert decode_request.output_queue.get_nowait() == "Hel"
+    prefill_request = engine.add_request("Prefill")
+    async def cancel_after_decode():
+        assert await decode_request.output_queue.get() == "lo"
+        assert engine.cancel_request(prefill_request.request_id)
+    cancellation_task = asyncio.create_task(cancel_after_decode())
+    await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(cancellation_task, engine.run()), timeout=5)
+    assert prefill_request.status == RequestStatus.CANCELLED
+    assert prefill_request.generated_token_ids == []
+    assert prefill_request.block_table == []
+    assert [call["request_ids"] for call in model.calls] == [[decode_request.request_id], [decode_request.request_id]]
+    assert engine.scheduler.running == []
+
 def test_engine_continuous_batching_replaces_finished_request():
-    model = Model(token_ids_by_call=[[2, 50], [60], [51]])
+    model = Model(token_ids_by_call=[[2, 50], [51], [60]])
     engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=3, max_batch_size=2, max_num_batched_tokens=20)
     short_request = engine.add_request("Short")
     long_request = engine.add_request("Long")
@@ -210,6 +248,25 @@ def test_engine_token_budget_limits_prefill_admission():
     assert second_request.generated_token_ids == []
     assert engine.scheduler.running == [first_request]
     assert list(engine.scheduler.waiting) == [second_request]
+
+def test_engine_cache_capacity_error_does_not_admit_request():
+    model = Model(token_ids_by_call=[[50]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=2)
+    engine.kv_cache = PagedKVCache(num_layers=2, num_blocks=1, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
+    occupied_block = engine.kv_cache.allocate_block()
+    request = engine.add_request("Waiting")
+    with pytest.raises(KVCacheExhaustedError):
+        engine.step()
+    assert request.status == RequestStatus.WAITING
+    assert request.num_computed_tokens == 0
+    assert request.block_table == []
+    assert list(engine.scheduler.waiting) == [request]
+    assert engine.scheduler.running == []
+    assert model.calls == []
+    engine.kv_cache.free_block(occupied_block)
+    assert not engine.step()
+    assert request.generated_token_ids == [50]
+    assert request.status == RequestStatus.FINISHED
 
 def test_engine_chunks_prompt_larger_than_token_budget():
     model = Model(token_ids_by_call=[[50], [50]])
@@ -254,7 +311,7 @@ def test_engine_streams_only_after_final_prefill_chunk():
     assert request.block_table == []
 
 def test_engine_samples_only_finished_prefill_rows_in_mixed_batch():
-    model = Model(token_ids_by_call=[[50, 60], [60], [51]])
+    model = Model(token_ids_by_call=[[50, 60], [51], [60]])
     tokenizer = Tokenizer(bos_token_id=3, prompt_token_ids={"Short": [10, 11], "Long": [20, 21, 22, 23]})
     engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=2, max_batch_size=2, max_num_batched_tokens=4, prefill_chunk_size=2)
     short_request = engine.add_request("Short")
@@ -270,9 +327,9 @@ def test_engine_samples_only_finished_prefill_rows_in_mixed_batch():
     assert short_request.generated_token_ids == [50, 51]
     assert long_request.generated_token_ids == [60]
     assert long_request.num_computed_tokens == 4
-    assert model.calls[1]["request_ids"] == [long_request.request_id]
+    assert model.calls[1]["request_ids"] == [short_request.request_id]
     assert model.calls[1]["start_pos"] == [2]
-    assert model.calls[2]["request_ids"] == [short_request.request_id]
+    assert model.calls[2]["request_ids"] == [long_request.request_id]
     assert model.calls[2]["start_pos"] == [2]
 
 def test_engine_cancels_waiting_request():
