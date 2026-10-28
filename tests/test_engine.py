@@ -91,13 +91,12 @@ def test_engine_prefill_batch_and_inference_mode():
     assert model.calls[0]["request_ids"] == [first_request.request_id, second_request.request_id]
     assert model.calls[0]["start_pos"] == [0, 0]
     assert model.calls[0]["input_lens"] == [2, 2]
-    assert model.calls[0]["kv_cache_manager"] is engine.paged_kv_cache
+    assert model.calls[0]["kv_cache_manager"] is engine.kv_cache
     assert model.calls[0]["block_tables"][0] is first_request.block_table
     assert model.calls[0]["block_tables"][1] is second_request.block_table
     assert first_request.block_table == [0]
     assert second_request.block_table == [1]
-    assert engine.paged_kv_cache.num_allocated_blocks == 2
-    assert engine.kv_cache_manager.caches == {}
+    assert engine.kv_cache.num_allocated_blocks == 2
 
 def test_engine_decode_and_length_stopping_streams_incremental_text():
     model = Model(token_ids_by_call=[[50], [51]])
@@ -119,8 +118,8 @@ def test_engine_decode_and_length_stopping_streams_incremental_text():
     assert model.calls[1]["start_pos"] == [2]
     assert model.calls[1]["input_lens"] == [1]
     assert request.block_table == []
-    assert engine.paged_kv_cache.num_allocated_blocks == 0
-    assert engine.paged_kv_cache.num_free_blocks == engine.paged_kv_cache.num_blocks
+    assert engine.kv_cache.num_allocated_blocks == 0
+    assert engine.kv_cache.num_free_blocks == engine.kv_cache.num_blocks
 
 def test_engine_eos_stopping():
     model = Model(token_ids_by_call=[[2]], eos_token_id=[2, 3])
@@ -133,7 +132,7 @@ def test_engine_eos_stopping():
     assert request not in engine.scheduler.running
     assert request.output_queue.get_nowait() is None
     assert request.block_table == []
-    assert engine.paged_kv_cache.num_allocated_blocks == 0
+    assert engine.kv_cache.num_allocated_blocks == 0
 
 def test_engine_rejects_missing_bos_and_pad_token_ids():
     model = Model(token_ids_by_call=[], bos_token_id=None, pad_token_id=None)
@@ -239,7 +238,7 @@ def test_engine_cancels_running_request_and_clears_queued_output():
     assert request.finish_reason == RequestFinishReason.CANCELLED
     assert request not in engine.scheduler.running
     assert request.block_table == []
-    assert engine.paged_kv_cache.num_allocated_blocks == 0
+    assert engine.kv_cache.num_allocated_blocks == 0
     assert request.output_queue.get_nowait() is None
     with pytest.raises(asyncio.QueueEmpty):
         request.output_queue.get_nowait()

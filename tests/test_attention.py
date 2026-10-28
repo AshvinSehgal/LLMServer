@@ -1,4 +1,5 @@
 import torch
+from unittest.mock import patch
 from transformers import AutoModelForCausalLM
 from utils.attention import SelfAttention
 from utils.kv_cache import PagedKVCache
@@ -69,10 +70,32 @@ def test_cached_self_attention_matches_full_attention():
         prefill_output = attention(prefill_hidden_states, prefill_pos_embeddings, full_mask[:, :, :3, :3], kv_cache=cache, layer_index=0, request_ids=["req-1"], block_tables=[block_table], start_pos=[0], input_lens=[3])
         decode_hidden_states = full_hidden_states[:, 3:]
         decode_pos_embeddings = rotary_embedding(decode_hidden_states, full_pos_ids[:, 3:])
-        decode_output = attention(decode_hidden_states, decode_pos_embeddings, torch.zeros(1, 1, 1, 4), kv_cache=cache, layer_index=0, request_ids=["req-1"], block_tables=[block_table], start_pos=[3], input_lens=[1])
+        with patch.object(cache, "get", side_effect=AssertionError("Decode must not gather the KV cache")):
+            decode_output = attention(decode_hidden_states, decode_pos_embeddings, torch.zeros(1, 1, 1, 4), kv_cache=cache, layer_index=0, request_ids=["req-1"], block_tables=[block_table], start_pos=[3], input_lens=[1])
     torch.testing.assert_close(prefill_output, full_output[:, :3], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(decode_output, full_output[:, 3:], rtol=1e-5, atol=1e-5)
     cached_keys, cached_values = cache.get(layer_index=0, block_table=block_table, end_pos=4)
     assert block_table == [0, 1]
     assert cached_keys.shape == (2, 4, 2)
     assert cached_values.shape == (2, 4, 2)
+
+def test_direct_paged_read_matches_gather_with_noncontiguous_blocks():
+    torch.manual_seed(42)
+    attention = SelfAttention(hidden_size=8, n_query_heads=4, n_kv_heads=2, head_dim=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6).eval()
+    cache = PagedKVCache(num_layers=1, num_blocks=4, block_size=3, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = [cache.allocate_block()]
+    cache.allocate_block()
+    block_table.append(cache.allocate_block())
+    keys = torch.randn(2, 5, 2)
+    values = torch.randn(2, 5, 2)
+    query = torch.randn(1, 4, 1, 2)
+    cache.append(0, block_table, 0, keys, values)
+    gathered_keys, gathered_values = cache.get(0, block_table, 5)
+    gathered_keys = gathered_keys.repeat_interleave(2, dim=0).unsqueeze(0)
+    gathered_values = gathered_values.repeat_interleave(2, dim=0).unsqueeze(0)
+    weights = torch.softmax(torch.matmul(query, gathered_keys.mT) * attention.attention_scaling, dim=-1, dtype=torch.float32)
+    expected = torch.matmul(weights, gathered_values)
+    with patch.object(cache, "get", side_effect=AssertionError("Direct paged read must not gather the KV cache")):
+        actual = attention.direct_paged_read(query, cache, 0, block_table, 5, 2)
+    assert block_table == [0, 2]
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
