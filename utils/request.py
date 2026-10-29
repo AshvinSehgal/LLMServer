@@ -57,6 +57,8 @@ class Request:
         self.finished_at = None
         self.block_table = []
         self.needs_decode_resume = False
+        self.waiting_steps = 0
+        self.preemption_count = 0
 
     @property
     def prefill_token_ids(self):
@@ -70,6 +72,7 @@ class Request:
         self.needs_decode_resume = self.needs_decode_resume or self.status == RequestStatus.DECODING
         self.status = RequestStatus.WAITING
         self.num_computed_tokens = 0
+        self.preemption_count += 1
     
     def start_prefill(self):
         if self.status != RequestStatus.WAITING:

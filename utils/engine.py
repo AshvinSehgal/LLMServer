@@ -224,9 +224,12 @@ class Engine:
             if num_blocks_needed <= self.kv_cache.num_free_blocks:
                 self.scheduler.commit(scheduler_output)
                 return scheduler_output
-            victim = next((request for request in reversed(self.scheduler.running) if request.block_table), None)
-            if victim is None or len(self.scheduler.running) == 1:
+            if len(self.scheduler.running) == 1:
                 raise KVCacheExhaustedError(f"Required blocks {num_blocks_needed} in KV cache exceeds currently free blocks")
+            candidates = [request for request in reversed(self.scheduler.running) if request.block_table]
+            if not candidates:
+                raise KVCacheExhaustedError(f"Required blocks {num_blocks_needed} in KV cache exceeds currently free blocks")
+            victim = sorted(candidates, key=(lambda x: (x.preemption_count, x.waiting_steps)))[0]
             self.preempt_request(victim)
 
     def step(self):

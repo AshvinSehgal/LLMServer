@@ -65,12 +65,14 @@ class Scheduler:
         return scheduler_output
 
     def commit(self, scheduler_output):
-        while scheduler_output.num_admitted_requests > 0:
+        for _ in range(scheduler_output.num_admitted_requests):
             request = self.waiting[0]
             request.start_prefill()
             self.waiting.popleft()
             self.running.append(request)
-            scheduler_output.num_admitted_requests -= 1
+        for request in self.waiting:
+            request.waiting_steps += 1
+            
 class SchedulerOutput:
     def __init__(self):
         self.num_admitted_requests = 0
