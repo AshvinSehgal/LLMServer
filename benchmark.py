@@ -72,6 +72,11 @@ def main():
         prompt_token_ids = [bos_token_id]
     input_ids = torch.tensor([prompt_token_ids], device=device, dtype=torch.long)
 
+    print("Warming up...", flush=True)
+    with torch.inference_mode():
+        reference_model.generate(input_ids=input_ids, max_new_tokens=args.max_new_tokens, do_sample=False, use_cache=True)
+    synchronize(device)
+
     print(f"Loaded in {load_seconds:.2f} s on {device}. Generating...", flush=True)
     synchronize(device)
     generation_start = time.perf_counter()
@@ -105,6 +110,11 @@ def main():
     block_size = 16
     num_blocks = math.ceil((prompt_length + args.max_new_tokens) / block_size) + 1
     engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=1, max_num_batched_tokens=128, kv_cache_num_blocks=num_blocks, kv_cache_block_size=block_size)
+    print("Warming up...", flush=True)
+    engine.add_request(args.prompt)
+    while engine.step():
+        pass
+    synchronize(device)
     request = engine.add_request(args.prompt)
 
     print(f"Loaded in {load_seconds:.2f} s on {device}. Generating...", flush=True)
