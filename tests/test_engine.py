@@ -33,6 +33,7 @@ class Model(nn.Module):
         self.token_ids_by_call = token_ids_by_call
         self.inference_mode_by_call = []
         self.calls = []
+        self.name = "fake-model"
 
     def forward(self, input_ids, pos_ids, attention_mask, **kwargs):
         self.inference_mode_by_call.append(torch.is_inference_mode_enabled())
@@ -122,6 +123,30 @@ def test_engine_marks_prompt_blocks_as_chunked_prefill_completes_them():
         assert engine.kv_cache.cacheable_blocks == set(request.block_table[:expected_complete_blocks])
         assert len(engine.kv_cache.cacheable_blocks) == expected_complete_blocks
 
+def test_engine_hash_is_deterministic_and_distinguishes_hash_inputs():
+    engine = Engine(model=Model(token_ids_by_call=[]), tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=2, max_batch_size=1, max_num_batched_tokens=4)
+    digest = engine.hash("root", [10, 11, 12, 13], "model-a", None)
+    assert digest == engine.hash("root", [10, 11, 12, 13], "model-a", None)
+    assert len(digest) == 64
+    assert digest != engine.hash("other-root", [10, 11, 12, 13], "model-a", None)
+    assert digest != engine.hash("root", [10, 11, 12, 14], "model-a", None)
+    assert digest != engine.hash("root", [10, 11, 12, 13], "model-b", None)
+    assert digest != engine.hash("root", [10, 11, 12, 13], "model-a", "adapter-a")
+
+@pytest.mark.parametrize(("first_prompt", "second_prompt", "expected_matches"), [([10, 11, 12, 13, 20, 21, 22, 23], [10, 11, 12, 13, 20, 21, 22, 23], [True, True]), ([10, 11, 12, 13, 20, 21, 22, 23], [99, 11, 12, 13, 20, 21, 22, 23], [False, False]), ([10, 11, 12, 13, 20, 21, 22, 23], [10, 11, 12, 13, 30, 31, 32, 33], [True, False])])
+def test_engine_hashes_complete_blocks_with_parent_prefix(first_prompt, second_prompt, expected_matches):
+    model = Model(token_ids_by_call=[[50, 60]])
+    tokenizer = Tokenizer(bos_token_id=3, prompt_token_ids={"First": first_prompt, "Second": second_prompt})
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=2, max_batch_size=2, max_num_batched_tokens=16, kv_cache_num_blocks=6, kv_cache_block_size=4)
+    first_request = engine.add_request("First")
+    second_request = engine.add_request("Second")
+    assert engine.step()
+    assert len(first_request.block_table) == len(second_request.block_table) == 2
+    for logical_block, expected_match in enumerate(expected_matches):
+        first_hash = engine.kv_cache.block_hashes[first_request.block_table[logical_block]]
+        second_hash = engine.kv_cache.block_hashes[second_request.block_table[logical_block]]
+        assert (first_hash == second_hash) == expected_match
+
 def test_engine_releases_cacheable_markers_when_request_finishes():
     model = Model(token_ids_by_call=[[50]])
     engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=[10, 11, 12, 13]), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=4, kv_cache_num_blocks=2, kv_cache_block_size=4)
@@ -129,6 +154,7 @@ def test_engine_releases_cacheable_markers_when_request_finishes():
     assert not engine.step()
     assert request.block_table == []
     assert engine.kv_cache.cacheable_blocks == set()
+    assert engine.kv_cache.block_hashes == {}
 
 def test_engine_decode_and_length_stopping_streams_incremental_text():
     model = Model(token_ids_by_call=[[50], [51]])

@@ -1,12 +1,9 @@
 """Run one prompt through the complete engine and measure generation speed."""
-
 import argparse
 import math
 import time
-
 import torch
 from transformers import AutoTokenizer
-
 from utils.engine import Engine
 from utils.model_loader import model_loader
 

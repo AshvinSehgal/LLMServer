@@ -92,19 +92,32 @@ def test_paged_kv_cache_starts_with_every_block_free():
     assert cache.num_free_blocks == 4
     assert cache.num_allocated_blocks == 0
     assert cache.cacheable_blocks == set()
+    assert cache.block_hashes == {}
 
 def test_paged_kv_cache_marks_allocated_block_cacheable_until_last_reference_is_freed():
     cache = PagedKVCache(num_layers=1, num_blocks=1, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
     block_id = cache.allocate_block()
     cache.add_cacheable_block(block_id)
+    cache.block_hashes[block_id] = "prompt-hash"
     assert cache.cacheable_blocks == {block_id}
+    assert cache.block_hashes == {block_id: "prompt-hash"}
     cache.retain_block(block_id)
     cache.free_block(block_id)
     assert cache.cacheable_blocks == {block_id}
+    assert cache.block_hashes == {block_id: "prompt-hash"}
     cache.free_block(block_id)
     assert cache.cacheable_blocks == set()
+    assert cache.block_hashes == {}
     assert cache.allocate_block() == block_id
     assert cache.cacheable_blocks == set()
+    assert cache.block_hashes == {}
+
+def test_paged_kv_cache_can_free_partial_block_without_hash():
+    cache = PagedKVCache(num_layers=1, num_blocks=1, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_id = cache.allocate_block()
+    cache.free_block(block_id)
+    assert cache.block_hashes == {}
+    assert cache.num_free_blocks == 1
 
 def test_paged_kv_cache_rejects_marking_unallocated_block_cacheable():
     cache = PagedKVCache(num_layers=1, num_blocks=2, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)

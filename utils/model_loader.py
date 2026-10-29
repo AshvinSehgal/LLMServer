@@ -33,6 +33,7 @@ def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None):
         attention_scaling=qwen_attention.scaling,
         rms_norm_eps=config.rms_norm_eps,
     ).to(dtype=dtype).eval()
+    my_model.name = model_name
     reference_state_dict = model.state_dict()
     mapped_state_dict = {key.removeprefix("model."): value for key, value in reference_state_dict.items()}
     my_model.load_state_dict(mapped_state_dict, strict=True)

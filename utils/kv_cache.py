@@ -92,6 +92,7 @@ class PagedKVCache:
         self.allocated_blocks = set()
         self.num_allocated_blocks = 0
         self.cacheable_blocks = set()
+        self.block_hashes = {}
 
     def add_cacheable_block(self, block_id):
         if block_id not in self.allocated_blocks:
@@ -116,6 +117,8 @@ class PagedKVCache:
             self.num_allocated_blocks -= 1
             self.free_blocks.append(block_id)
             self.cacheable_blocks.discard(block_id)
+            if block_id in self.block_hashes:
+                del self.block_hashes[block_id]
             self.num_free_blocks += 1
     
     def free_block_table(self, block_table):

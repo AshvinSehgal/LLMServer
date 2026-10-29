@@ -4,6 +4,8 @@ from collections import OrderedDict
 from datetime import datetime, timedelta
 import torch
 import math
+import hashlib
+import json
 from utils.scheduler import Scheduler
 from utils.request import Request, RequestStatus, RequestFinishReason, CompletedRequest
 from utils.batch import PrefillBatch, DecodeBatch
@@ -73,6 +75,10 @@ class Engine:
         else:
             self.eos_token_ids = set(eos_token_ids)
     
+    def hash(self, parent_hash, tokens, model_identity, adapter_id):
+        payload = json.dumps([parent_hash, tokens, model_identity, adapter_id], separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
     def add_request(self, prompt):
         self.prune_completed_requests()
         if not prompt or prompt.strip() == "":
@@ -199,6 +205,17 @@ class Engine:
             for logical_block in range(old_complete, new_complete):
                 physical_id = request.block_table[logical_block]
                 self.kv_cache.add_cacheable_block(physical_id)
+                start = logical_block * self.block_size
+                tokens = request.prompt_token_ids[start : start + self.block_size]
+                if logical_block == 0:
+                    parent_hash = "root"
+                else:
+                    prev_physical_id = request.block_table[logical_block - 1]
+                    parent_hash = self.kv_cache.block_hashes[prev_physical_id]
+                model_identity = self.model.name
+                adapter_id = "none"
+                digest = self.hash(parent_hash, tokens, model_identity, adapter_id)
+                self.kv_cache.block_hashes[physical_id] = digest
             if request.num_computed_tokens == len(request.prefill_token_ids):
                 needs_decode_resume = request.needs_decode_resume
                 request.complete_prefill()
