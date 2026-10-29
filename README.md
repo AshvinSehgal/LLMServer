@@ -64,6 +64,14 @@ Run only the fast scheduler, engine, batch and KV-cache tests:
 python -m pytest -q tests/test_request.py tests/test_scheduler.py tests/test_batch.py tests/test_engine.py tests/test_kv_cache.py
 ```
 
+To run a sample prompt through the complete engine and measure its speed:
+
+```bash
+python benchmark.py --prompt "Explain what a KV cache does in one sentence." --max-new-tokens 32
+```
+
+The script reports model-loading time separately from generation time, along with time to first token and tokens per second. It runs on CPU when neither MPS nor CUDA is available; the CPU result will be much slower than a GPU result.
+
 ## Development status
 
 The single-request model, custom transformer implementation, multi-request scheduler and contiguous KV-cache manager are complete. The next development version replaces the per-request contiguous allocations with a paged KV cache, block tables and a shared free-block pool.

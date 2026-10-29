@@ -268,6 +268,24 @@ def test_engine_cache_capacity_error_does_not_admit_request():
     assert request.generated_token_ids == [50]
     assert request.status == RequestStatus.FINISHED
 
+def test_engine_waits_for_cache_headroom_before_admitting_request():
+    model = Model(token_ids_by_call=[[50], [51], [60]])
+    tokenizer = Tokenizer(bos_token_id=3, prompt_token_ids={"First": [10, 11], "Second": [20, 21]})
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=2, max_batch_size=2, max_num_batched_tokens=4, kv_cache_num_blocks=3, kv_cache_block_size=2)
+    first_request = engine.add_request("First")
+    assert engine.step()
+    second_request = engine.add_request("Second")
+    assert engine.step()
+    assert first_request.status == RequestStatus.FINISHED
+    assert first_request.block_table == []
+    assert second_request.status == RequestStatus.WAITING
+    assert second_request.generated_token_ids == []
+    assert list(engine.scheduler.waiting) == [second_request]
+    assert engine.step()
+    assert second_request.generated_token_ids == [60]
+    assert second_request.status == RequestStatus.DECODING
+    assert [call["request_ids"] for call in model.calls] == [[first_request.request_id], [first_request.request_id], [second_request.request_id]]
+
 def test_engine_chunks_prompt_larger_than_token_budget():
     model = Model(token_ids_by_call=[[50], [50]])
     engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=1)

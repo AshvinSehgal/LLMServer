@@ -12,7 +12,7 @@ from utils.kv_cache import PagedKVCache, KVCacheExhaustedError
 STREAM_END = None
 
 class Engine:
-    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600, prefill_chunk_size=None):
+    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600, prefill_chunk_size=None, kv_cache_num_blocks=500, kv_cache_block_size=500):
         self.model = model
         self.tokenizer = tokenizer
         self.device = next(model.parameters()).device
@@ -32,8 +32,8 @@ class Engine:
         self.scheduler = Scheduler(max_batch_size, max_num_batched_tokens, prefill_chunk_size)
         self.active_requests = {}
         self.completed_requests = OrderedDict()
-        self.num_blocks = 500
-        self.block_size = 500
+        self.num_blocks = kv_cache_num_blocks
+        self.block_size = kv_cache_block_size
         config = self.model.config
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.kv_cache = PagedKVCache(
@@ -207,7 +207,7 @@ class Engine:
         self.scheduler.running[:] = [request for request in self.scheduler.running if request.status not in (RequestStatus.FINISHED, RequestStatus.CANCELLED)]
 
     def schedule_step(self):
-        scheduler_output = self.scheduler.plan()
+        scheduler_output = self.scheduler.plan(self.kv_cache.num_free_blocks, self.block_size)
         decode_requests = scheduler_output.decode_requests
         prefill_requests = scheduler_output.prefill_requests
         num_blocks_needed = sum(max(0, math.ceil((request.num_computed_tokens + chunk_len) / self.kv_cache.block_size) - len(request.block_table)) for request, chunk_len in zip(prefill_requests, scheduler_output.prefill_token_counts))

@@ -2,12 +2,13 @@ import asyncio
 import pytest
 from utils.request import Request, RequestStatus
 from utils.scheduler import Scheduler, SchedulerOutput
+from utils.kv_cache import KVCacheExhaustedError
 
 def create_request(request_id, prompt_token_ids=None):
     return Request(request_id, "Hello", prompt_token_ids or [9707], 20, asyncio.Queue())
 
-def schedule_and_commit(scheduler):
-    output = scheduler.plan()
+def schedule_and_commit(scheduler, free_blocks=100, block_size=2):
+    output = scheduler.plan(free_blocks, block_size)
     scheduler.commit(output)
     return output
 
@@ -128,7 +129,7 @@ def test_scheduler_plan_does_not_mutate_requests():
     scheduler = Scheduler(max_batch_size=2, max_num_batched_tokens=2)
     requests = [create_request("req-1"), create_request("req-2")]
     scheduler.waiting.extend(requests)
-    output = scheduler.plan()
+    output = scheduler.plan(free_blocks=100, block_size=2)
     assert output.prefill_requests == requests
     assert output.prefill_token_counts == [1, 1]
     assert output.num_admitted_requests == 2
@@ -139,3 +140,74 @@ def test_scheduler_plan_does_not_mutate_requests():
     assert list(scheduler.waiting) == []
     assert scheduler.running == requests
     assert all(request.status == RequestStatus.PREFILL for request in requests)
+
+def test_scheduler_empty_plan_does_not_raise():
+    scheduler = Scheduler(max_batch_size=1, max_num_batched_tokens=1)
+    output = scheduler.plan(free_blocks=1, block_size=2)
+    assert output.prefill_requests == []
+    assert output.decode_requests == []
+    assert output.num_admitted_requests == 0
+    assert output.num_scheduled_tokens == 0
+
+def test_scheduler_keeps_waiting_request_when_decode_needs_cache_headroom():
+    scheduler = Scheduler(max_batch_size=2, max_num_batched_tokens=2)
+    decode_request = create_request("req-decode", [10, 11])
+    decode_request.start_prefill()
+    decode_request.advance_prefill(2)
+    decode_request.complete_prefill()
+    decode_request.block_table = [0]
+    waiting_request = create_request("req-waiting", [20])
+    scheduler.running.append(decode_request)
+    scheduler.waiting.append(waiting_request)
+    output = scheduler.plan(free_blocks=2, block_size=2)
+    assert output.decode_requests == [decode_request]
+    assert output.prefill_requests == []
+    assert output.num_admitted_requests == 0
+    assert output.num_scheduled_tokens == 1
+    scheduler.commit(output)
+    assert scheduler.running == [decode_request]
+    assert list(scheduler.waiting) == [waiting_request]
+    assert waiting_request.status == RequestStatus.WAITING
+
+def test_scheduler_admits_waiting_request_when_decode_has_cache_headroom():
+    scheduler = Scheduler(max_batch_size=2, max_num_batched_tokens=2)
+    decode_request = create_request("req-decode", [10, 11])
+    decode_request.start_prefill()
+    decode_request.advance_prefill(2)
+    decode_request.complete_prefill()
+    decode_request.block_table = [0]
+    waiting_request = create_request("req-waiting", [20])
+    scheduler.running.append(decode_request)
+    scheduler.waiting.append(waiting_request)
+    output = scheduler.plan(free_blocks=3, block_size=2)
+    assert output.decode_requests == [decode_request]
+    assert output.prefill_requests == [waiting_request]
+    assert output.prefill_token_counts == [1]
+    assert output.num_admitted_requests == 1
+    assert output.num_scheduled_tokens == 2
+    scheduler.commit(output)
+    assert scheduler.running == [decode_request, waiting_request]
+    assert list(scheduler.waiting) == []
+    assert waiting_request.status == RequestStatus.PREFILL
+
+def test_scheduler_rejects_request_when_idle_cache_has_no_free_blocks():
+    scheduler = Scheduler(max_batch_size=1, max_num_batched_tokens=1)
+    request = create_request("req-waiting")
+    scheduler.waiting.append(request)
+    with pytest.raises(KVCacheExhaustedError):
+        scheduler.plan(free_blocks=0, block_size=2)
+    assert list(scheduler.waiting) == [request]
+    assert scheduler.running == []
+    assert request.status == RequestStatus.WAITING
+
+def test_scheduler_shrinks_prefill_chunk_to_fit_available_cache_blocks():
+    scheduler = Scheduler(max_batch_size=1, max_num_batched_tokens=5)
+    request = create_request("req-long", [10, 11, 12, 13, 14])
+    scheduler.waiting.append(request)
+    output = scheduler.plan(free_blocks=1, block_size=2)
+    assert output.prefill_requests == [request]
+    assert output.prefill_token_counts == [2]
+    assert output.num_admitted_requests == 1
+    assert output.num_scheduled_tokens == 2
+    assert list(scheduler.waiting) == [request]
+    assert request.status == RequestStatus.WAITING
