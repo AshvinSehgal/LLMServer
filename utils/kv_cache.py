@@ -91,6 +91,12 @@ class PagedKVCache:
         self.num_free_blocks = self.num_blocks
         self.allocated_blocks = set()
         self.num_allocated_blocks = 0
+        self.cacheable_blocks = set()
+
+    def add_cacheable_block(self, block_id):
+        if block_id not in self.allocated_blocks:
+            raise KVCacheStateError(f"Block {block_id} cannot be cached, it isn't currently allocated")
+        self.cacheable_blocks.add(block_id)
     
     def retain_block(self, block_id):
         if block_id < 0 or block_id >= self.num_blocks:
@@ -109,6 +115,7 @@ class PagedKVCache:
             self.allocated_blocks.discard(block_id)
             self.num_allocated_blocks -= 1
             self.free_blocks.append(block_id)
+            self.cacheable_blocks.discard(block_id)
             self.num_free_blocks += 1
     
     def free_block_table(self, block_table):

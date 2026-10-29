@@ -193,7 +193,12 @@ class Engine:
         logits = self.process_batch(prefill_batch)
         final_rows = []
         for row, (request, chunk_len) in enumerate(prefill_work):
+            old_complete = min(request.num_computed_tokens, len(request.prompt_token_ids)) // self.block_size
             request.advance_prefill(chunk_len)
+            new_complete = min(request.num_computed_tokens, len(request.prompt_token_ids)) // self.block_size
+            for logical_block in range(old_complete, new_complete):
+                physical_id = request.block_table[logical_block]
+                self.kv_cache.add_cacheable_block(physical_id)
             if request.num_computed_tokens == len(request.prefill_token_ids):
                 needs_decode_resume = request.needs_decode_resume
                 request.complete_prefill()

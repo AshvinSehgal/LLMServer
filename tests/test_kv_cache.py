@@ -91,6 +91,30 @@ def test_paged_kv_cache_starts_with_every_block_free():
     assert cache.allocated_blocks == set()
     assert cache.num_free_blocks == 4
     assert cache.num_allocated_blocks == 0
+    assert cache.cacheable_blocks == set()
+
+def test_paged_kv_cache_marks_allocated_block_cacheable_until_last_reference_is_freed():
+    cache = PagedKVCache(num_layers=1, num_blocks=1, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_id = cache.allocate_block()
+    cache.add_cacheable_block(block_id)
+    assert cache.cacheable_blocks == {block_id}
+    cache.retain_block(block_id)
+    cache.free_block(block_id)
+    assert cache.cacheable_blocks == {block_id}
+    cache.free_block(block_id)
+    assert cache.cacheable_blocks == set()
+    assert cache.allocate_block() == block_id
+    assert cache.cacheable_blocks == set()
+
+def test_paged_kv_cache_rejects_marking_unallocated_block_cacheable():
+    cache = PagedKVCache(num_layers=1, num_blocks=2, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    with pytest.raises(KVCacheStateError):
+        cache.add_cacheable_block(0)
+    block_id = cache.allocate_block()
+    cache.free_block(block_id)
+    with pytest.raises(KVCacheStateError):
+        cache.add_cacheable_block(block_id)
+    assert cache.cacheable_blocks == set()
 
 def test_paged_kv_cache_allocates_blocks_in_order_without_reallocating_storage():
     cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=5, num_kv_heads=3, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)

@@ -102,6 +102,34 @@ def test_engine_prefill_batch_and_inference_mode():
     assert second_request.block_table == [1]
     assert engine.kv_cache.num_allocated_blocks == 2
 
+@pytest.mark.parametrize(("prompt_length", "expected_complete_blocks"), [(3, 0), (4, 1), (6, 1), (8, 2)])
+def test_engine_marks_only_complete_prompt_blocks_cacheable(prompt_length, expected_complete_blocks):
+    model = Model(token_ids_by_call=[[50]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=list(range(10, 10 + prompt_length))), max_new_tokens=2, max_batch_size=1, max_num_batched_tokens=8, kv_cache_num_blocks=4, kv_cache_block_size=4)
+    request = engine.add_request("Hello")
+    assert engine.step()
+    assert request.num_computed_tokens == prompt_length
+    assert engine.kv_cache.cacheable_blocks == set(request.block_table[:expected_complete_blocks])
+    assert len(engine.kv_cache.cacheable_blocks) == expected_complete_blocks
+
+def test_engine_marks_prompt_blocks_as_chunked_prefill_completes_them():
+    model = Model(token_ids_by_call=[[50], [50], [50]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=list(range(10, 18))), max_new_tokens=2, max_batch_size=1, max_num_batched_tokens=3, prefill_chunk_size=3, kv_cache_num_blocks=4, kv_cache_block_size=4)
+    request = engine.add_request("Hello")
+    for expected_computed_tokens, expected_complete_blocks in [(3, 0), (6, 1), (8, 2)]:
+        assert engine.step()
+        assert request.num_computed_tokens == expected_computed_tokens
+        assert engine.kv_cache.cacheable_blocks == set(request.block_table[:expected_complete_blocks])
+        assert len(engine.kv_cache.cacheable_blocks) == expected_complete_blocks
+
+def test_engine_releases_cacheable_markers_when_request_finishes():
+    model = Model(token_ids_by_call=[[50]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=[10, 11, 12, 13]), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=4, kv_cache_num_blocks=2, kv_cache_block_size=4)
+    request = engine.add_request("Hello")
+    assert not engine.step()
+    assert request.block_table == []
+    assert engine.kv_cache.cacheable_blocks == set()
+
 def test_engine_decode_and_length_stopping_streams_incremental_text():
     model = Model(token_ids_by_call=[[50], [51]])
     engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=2, max_batch_size=1, max_num_batched_tokens=20)
