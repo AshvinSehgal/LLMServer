@@ -141,6 +141,25 @@ def test_scheduler_plan_does_not_mutate_requests():
     assert scheduler.running == requests
     assert all(request.status == RequestStatus.PREFILL for request in requests)
 
+def test_scheduler_waiting_steps_advance_once_per_committed_step():
+    scheduler = Scheduler(max_batch_size=1, max_num_batched_tokens=1)
+    requests = [create_request(f"req-{index}") for index in range(3)]
+    scheduler.waiting.extend(requests)
+    first_output = scheduler.plan(free_blocks=10, block_size=2)
+    assert [request.waiting_steps for request in requests] == [0, 0, 0]
+    scheduler.commit(first_output)
+    assert [request.waiting_steps for request in requests] == [0, 1, 1]
+    second_output = scheduler.plan(free_blocks=10, block_size=2)
+    assert [request.waiting_steps for request in requests] == [0, 1, 1]
+    scheduler.commit(second_output)
+    assert [request.waiting_steps for request in requests] == [0, 2, 2]
+    scheduler.running.remove(requests[0])
+    third_output = scheduler.plan(free_blocks=10, block_size=2)
+    scheduler.commit(third_output)
+    assert scheduler.running == [requests[1]]
+    assert list(scheduler.waiting) == [requests[2]]
+    assert [request.waiting_steps for request in requests] == [0, 2, 3]
+
 def test_scheduler_empty_plan_does_not_raise():
     scheduler = Scheduler(max_batch_size=1, max_num_batched_tokens=1)
     output = scheduler.plan(free_blocks=1, block_size=2)

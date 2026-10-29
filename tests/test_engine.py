@@ -317,6 +317,28 @@ def test_engine_recompute_preemption_resumes_decode_without_duplicate_output():
     assert model.calls[4]["input_ids"] == [[51]]
     assert [call["request_ids"] for call in model.calls] == [[first_request.request_id, second_request.request_id], [first_request.request_id, second_request.request_id], [first_request.request_id], [second_request.request_id], [second_request.request_id]]
 
+@pytest.mark.parametrize(("first_priority", "second_priority", "victim_index"), [((0, 0), (0, 0), 1), ((0, 0), (1, 0), 0), ((1, 1), (1, 3), 0), ((1, 3), (1, 1), 1)])
+def test_engine_preemption_victim_priority(first_priority, second_priority, victim_index):
+    model = Model(token_ids_by_call=[[50, 60], [51, 51]])
+    tokenizer = Tokenizer(bos_token_id=3, prompt_token_ids={"First": [10], "Second": [20]})
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=3, max_batch_size=2, max_num_batched_tokens=2, kv_cache_num_blocks=2, kv_cache_block_size=2)
+    requests = [engine.add_request("First"), engine.add_request("Second")]
+    assert engine.step()
+    assert engine.step()
+    assert engine.kv_cache.num_free_blocks == 0
+    for request, (preemption_count, waiting_steps) in zip(requests, (first_priority, second_priority)):
+        request.preemption_count = preemption_count
+        request.waiting_steps = waiting_steps
+    output = engine.schedule_step()
+    victim = requests[victim_index]
+    survivor = requests[1 - victim_index]
+    assert output.decode_requests == [survivor]
+    assert engine.scheduler.running == [survivor]
+    assert list(engine.scheduler.waiting) == [victim]
+    assert victim.status == RequestStatus.WAITING
+    assert victim.preemption_count == (first_priority, second_priority)[victim_index][0] + 1
+    assert victim.block_table == []
+
 def test_engine_recompute_preemption_during_prefill_restarts_prompt():
     model = Model(token_ids_by_call=[[50], [50], [50], [50]])
     engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=[10, 11, 12]), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=1, prefill_chunk_size=1, kv_cache_num_blocks=2, kv_cache_block_size=2)

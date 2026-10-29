@@ -13,13 +13,14 @@ The project currently targets the Qwen3 architecture and uses Hugging Face only 
 - Incremental text streaming through `asyncio.Queue`
 - Waiting and running request queues
 - Padded prefill batches and single-token decode batches
-- Continuous batching with batch-size and token-budget limits
+- Continuous batching with batch-size and token-budget limits, chunked prefill and cache-aware admission
+- Recompute preemption when running requests need more KV-cache blocks
 - Request cancellation and lifecycle tracking
 - Bounded, time-limited summaries for completed requests
-- Per-request contiguous KV-cache allocation, append, read and free operations
-- KV-cache integration across the engine, model layers and grouped-query attention
+- Paged KV cache with per-request block tables, shared physical blocks and reference counts
+- Direct paged-cache reads during decode, integrated across the engine, model layers and grouped-query attention
 
-Prefill writes each request's keys and values into its own contiguous cache. Later decode steps process only the newest token and attend to the previously cached history. Finished and cancelled requests release their cache allocations.
+Prefill writes each request's keys and values into blocks referenced by its block table. Later decode steps process only the newest token and read the previously cached history directly from those blocks. Finished and cancelled requests release their block references.
 
 ## Project structure
 
@@ -28,7 +29,7 @@ utils/
 ├── attention.py      # Grouped-query self-attention
 ├── batch.py          # Prefill and decode batch construction
 ├── engine.py         # Generation loop, streaming and request handling
-├── kv_cache.py       # Per-request contiguous KV-cache manager
+├── kv_cache.py       # Paged KV-cache manager and legacy contiguous cache
 ├── layers.py         # RMSNorm, RoPE and MLP components
 ├── model.py          # Decoder layer and complete transformer model
 ├── model_loader.py   # Hugging Face configuration and weight loading
@@ -61,7 +62,7 @@ python -m pytest -q
 Run only the fast scheduler, engine, batch and KV-cache tests:
 
 ```bash
-python -m pytest -q tests/test_request.py tests/test_scheduler.py tests/test_batch.py tests/test_engine.py tests/test_kv_cache.py
+python -m pytest -q tests/test_request.py tests/test_scheduler.py tests/test_batch.py tests/test_engine.py tests/test_kv_cache.py tests/test_cached_model.py
 ```
 
 To run a sample prompt through the complete engine and measure its speed:
@@ -74,6 +75,6 @@ The script reports model-loading time separately from generation time, along wit
 
 ## Development status
 
-The single-request model, custom transformer implementation, multi-request scheduler and contiguous KV-cache manager are complete. The next development version replaces the per-request contiguous allocations with a paged KV cache, block tables and a shared free-block pool.
+The single-request model, custom transformer implementation, multi-request scheduler, paged KV cache and chunked prefill are implemented. The next development version focuses on prefix caching and reusing completed blocks across requests.
 
-This repository is a learning project rather than a production-ready inference server. Features such as paged attention, chunked prefill, prefix caching, optimized kernels, distributed inference and an HTTP API are planned for later iterations.
+This repository is a learning project rather than a production-ready inference server. The paged decode path is implemented in PyTorch; optimized kernels, distributed inference and an HTTP API are planned for later iterations.
