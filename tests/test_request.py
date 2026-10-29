@@ -87,3 +87,44 @@ def test_request_block_tables_track_allocated_physical_blocks():
     assert second_request.block_table == [1]
     assert set(first_request.block_table).isdisjoint(second_request.block_table)
     assert set(first_request.block_table + second_request.block_table) <= cache.allocated_blocks
+
+def test_request_recompute_after_decode_preserves_generated_tokens():
+    output_queue = asyncio.Queue()
+    request = Request("req-1", "Hello", [10, 11], 20, output_queue)
+    request.start_prefill()
+    request.advance_prefill(2)
+    request.complete_prefill()
+    request.append_generated_token(50)
+    request.complete_decode()
+    request.append_generated_token(51)
+    request.emitted_text = "Hello"
+    output_queue.put_nowait("Hello")
+    request.preempt_for_compute()
+    assert request.status == RequestStatus.WAITING
+    assert request.num_computed_tokens == 0
+    assert request.prompt_token_ids == [10, 11]
+    assert request.prefill_token_ids == [10, 11, 50]
+    assert request.generated_token_ids == [50, 51]
+    assert request.emitted_text == "Hello"
+    assert output_queue.get_nowait() == "Hello"
+    request.start_prefill()
+    request.advance_prefill(1)
+    request.preempt_for_compute()
+    assert request.prefill_token_ids == [10, 11, 50]
+    assert request.needs_decode_resume
+    request.start_prefill()
+    request.advance_prefill(3)
+    request.complete_prefill()
+    assert request.status == RequestStatus.DECODING
+    assert request.num_computed_tokens == 3
+    assert not request.needs_decode_resume
+
+def test_request_recompute_during_prefill_restarts_original_prompt():
+    request = Request("req-1", "Hello", [10, 11, 12], 20, asyncio.Queue())
+    request.start_prefill()
+    request.advance_prefill(1)
+    request.preempt_for_compute()
+    assert request.status == RequestStatus.WAITING
+    assert request.num_computed_tokens == 0
+    assert request.prefill_token_ids == [10, 11, 12]
+    assert not request.needs_decode_resume

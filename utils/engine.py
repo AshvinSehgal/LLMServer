@@ -194,9 +194,11 @@ class Engine:
         final_rows = []
         for row, (request, chunk_len) in enumerate(prefill_work):
             request.advance_prefill(chunk_len)
-            if request.num_computed_tokens == len(request.prompt_token_ids):
+            if request.num_computed_tokens == len(request.prefill_token_ids):
+                needs_decode_resume = request.needs_decode_resume
                 request.complete_prefill()
-                final_rows.append(row)
+                if not needs_decode_resume:
+                    final_rows.append(row)
         if final_rows:
             final_logits = logits[final_rows, prefill_batch.last_token_indices[final_rows]]
             next_token_ids = torch.argmax(final_logits, dim=-1).tolist()
@@ -206,16 +208,26 @@ class Engine:
     def remove_finished_and_cancelled_requests(self):
         self.scheduler.running[:] = [request for request in self.scheduler.running if request.status not in (RequestStatus.FINISHED, RequestStatus.CANCELLED)]
 
+    def preempt_request(self, request):
+        self.release_request_resources(request)
+        self.scheduler.running.remove(request)
+        request.preempt_for_compute()
+        self.scheduler.waiting.append(request)
+
     def schedule_step(self):
-        scheduler_output = self.scheduler.plan(self.kv_cache.num_free_blocks, self.block_size)
-        decode_requests = scheduler_output.decode_requests
-        prefill_requests = scheduler_output.prefill_requests
-        num_blocks_needed = sum(max(0, math.ceil((request.num_computed_tokens + chunk_len) / self.kv_cache.block_size) - len(request.block_table)) for request, chunk_len in zip(prefill_requests, scheduler_output.prefill_token_counts))
-        num_blocks_needed += sum(max(0, math.ceil((request.num_computed_tokens + 1) / self.kv_cache.block_size) - len(request.block_table)) for request in decode_requests)
-        if num_blocks_needed > self.kv_cache.num_free_blocks:
-            raise KVCacheExhaustedError(f"Required blocks {num_blocks_needed} in KV cache exceeds currently free blocks")
-        self.scheduler.commit(scheduler_output)
-        return scheduler_output
+        while True:
+            scheduler_output = self.scheduler.plan(self.kv_cache.num_free_blocks, self.block_size)
+            decode_requests = scheduler_output.decode_requests
+            prefill_requests = scheduler_output.prefill_requests
+            num_blocks_needed = sum(max(0, math.ceil((request.num_computed_tokens + chunk_len) / self.kv_cache.block_size) - len(request.block_table)) for request, chunk_len in zip(prefill_requests, scheduler_output.prefill_token_counts))
+            num_blocks_needed += sum(max(0, math.ceil((request.num_computed_tokens + 1) / self.kv_cache.block_size) - len(request.block_table)) for request in decode_requests)
+            if num_blocks_needed <= self.kv_cache.num_free_blocks:
+                self.scheduler.commit(scheduler_output)
+                return scheduler_output
+            victim = next((request for request in reversed(self.scheduler.running) if request.block_table), None)
+            if victim is None or len(self.scheduler.running) == 1:
+                raise KVCacheExhaustedError(f"Required blocks {num_blocks_needed} in KV cache exceeds currently free blocks")
+            self.preempt_request(victim)
 
     def step(self):
         scheduler_output = self.schedule_step()

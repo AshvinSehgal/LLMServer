@@ -286,6 +286,71 @@ def test_engine_waits_for_cache_headroom_before_admitting_request():
     assert second_request.status == RequestStatus.DECODING
     assert [call["request_ids"] for call in model.calls] == [[first_request.request_id], [first_request.request_id], [second_request.request_id]]
 
+def test_engine_recompute_preemption_resumes_decode_without_duplicate_output():
+    model = Model(token_ids_by_call=[[50, 60], [51, 51], [51], [50], [51]])
+    tokenizer = Tokenizer(bos_token_id=3, prompt_token_ids={"First": [10], "Second": [20]})
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=3, max_batch_size=2, max_num_batched_tokens=2, kv_cache_num_blocks=2, kv_cache_block_size=2)
+    first_request = engine.add_request("First")
+    second_request = engine.add_request("Second")
+    assert engine.step()
+    assert engine.step()
+    assert second_request.generated_token_ids == [60, 51]
+    assert second_request.output_queue.get_nowait() == "World"
+    assert second_request.output_queue.get_nowait() == "lo"
+    assert engine.kv_cache.num_free_blocks == 0
+    assert engine.step()
+    assert first_request.status == RequestStatus.FINISHED
+    assert second_request.status == RequestStatus.WAITING
+    assert second_request.prefill_token_ids == [20, 60]
+    assert second_request.generated_token_ids == [60, 51]
+    assert second_request.block_table == []
+    assert second_request.output_queue.empty()
+    assert engine.step()
+    assert second_request.status == RequestStatus.DECODING
+    assert second_request.num_computed_tokens == 2
+    assert second_request.generated_token_ids == [60, 51]
+    assert second_request.output_queue.empty()
+    assert model.calls[3]["input_ids"] == [[20, 60]]
+    assert not engine.step()
+    assert second_request.generated_token_ids == [60, 51, 51]
+    assert second_request.status == RequestStatus.FINISHED
+    assert model.calls[4]["input_ids"] == [[51]]
+    assert [call["request_ids"] for call in model.calls] == [[first_request.request_id, second_request.request_id], [first_request.request_id, second_request.request_id], [first_request.request_id], [second_request.request_id], [second_request.request_id]]
+
+def test_engine_recompute_preemption_during_prefill_restarts_prompt():
+    model = Model(token_ids_by_call=[[50], [50], [50], [50]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=[10, 11, 12]), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=1, prefill_chunk_size=1, kv_cache_num_blocks=2, kv_cache_block_size=2)
+    request = engine.add_request("Hello")
+    assert engine.step()
+    assert request.status == RequestStatus.PREFILL
+    assert request.num_computed_tokens == 1
+    assert engine.kv_cache.num_free_blocks == 1
+    engine.preempt_request(request)
+    assert request.status == RequestStatus.WAITING
+    assert request.num_computed_tokens == 0
+    assert request.block_table == []
+    assert engine.kv_cache.num_free_blocks == 2
+    assert engine.step()
+    assert engine.step()
+    assert not engine.step()
+    assert request.generated_token_ids == [50]
+    assert request.status == RequestStatus.FINISHED
+    assert [call["input_ids"] for call in model.calls] == [[[10]], [[10]], [[11]], [[12]]]
+
+def test_engine_does_not_preempt_the_only_running_request_in_a_loop():
+    model = Model(token_ids_by_call=[[50]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=2, max_batch_size=1, max_num_batched_tokens=2, kv_cache_num_blocks=1, kv_cache_block_size=2)
+    request = engine.add_request("Hello")
+    assert engine.step()
+    with pytest.raises(KVCacheExhaustedError):
+        engine.step()
+    assert request.status == RequestStatus.DECODING
+    assert request.generated_token_ids == [50]
+    assert len(request.block_table) == 1
+    assert engine.scheduler.running == [request]
+    assert list(engine.scheduler.waiting) == []
+    assert len(model.calls) == 1
+
 def test_engine_chunks_prompt_larger_than_token_budget():
     model = Model(token_ids_by_call=[[50], [50]])
     engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=1)

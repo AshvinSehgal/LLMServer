@@ -8,11 +8,11 @@ class PrefillBatch:
         if pad_token_id is None:
             raise ValueError(f"pad_token_id is required: {pad_token_id}")
         if chunk_lengths is None:
-            chunk_lengths = [len(request.prompt_token_ids) - request.num_computed_tokens for request in requests]
+            chunk_lengths = [len(request.prefill_token_ids) - request.num_computed_tokens for request in requests]
         if len(chunk_lengths) != len(requests):
             raise ValueError(f"Chunk lengths must contain one entry per request: requests: {len(requests)}, chunk_lengths: {len(chunk_lengths)}")
         for request, chunk_length in zip(requests, chunk_lengths):
-            remaining_prompt = len(request.prompt_token_ids) - request.num_computed_tokens
+            remaining_prompt = len(request.prefill_token_ids) - request.num_computed_tokens
             if chunk_length <= 0 or chunk_length > remaining_prompt:
                 raise ValueError(f"Invalid prefill chunk length: request_id: {request.request_id}, chunk_length: {chunk_length}, remaining_prompt: {remaining_prompt}")
         self.requests = requests
@@ -25,7 +25,7 @@ class PrefillBatch:
         self.prompt_lengths = torch.tensor(self.input_lens, device=device, dtype=torch.long)
         self.max_prompt_length = max(self.input_lens)
         self.last_token_indices = self.prompt_lengths - 1
-        self.input_ids = torch.tensor([request.prompt_token_ids[start:end] + [self.pad_token_id] * (self.max_prompt_length - length) for request, start, end, length in zip(self.requests, self.start_pos, self.end_pos, self.input_lens)], device=device, dtype=torch.long)
+        self.input_ids = torch.tensor([request.prefill_token_ids[start:end] + [self.pad_token_id] * (self.max_prompt_length - length) for request, start, end, length in zip(self.requests, self.start_pos, self.end_pos, self.input_lens)], device=device, dtype=torch.long)
         self.padding_mask = torch.tensor([[index < length for index in range(self.max_prompt_length)] for length in self.input_lens], device=device, dtype=torch.bool)
         self.pos_ids = torch.tensor([list(range(start, end)) + [0] * (self.max_prompt_length - length) for start, end, length in zip(self.start_pos, self.end_pos, self.input_lens)], device=device, dtype=torch.long)
         key_positions = torch.arange(max(self.end_pos), device=device).view(1, 1, 1, -1)

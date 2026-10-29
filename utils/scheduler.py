@@ -28,8 +28,9 @@ class Scheduler:
         used_tokens = len(scheduler_output.decode_requests)
         remaining_tokens = self.max_num_batched_tokens - used_tokens
         for request in self.running:
+            blocks_needed = 0
             if request.status == RequestStatus.PREFILL:
-                remaining_prompt = len(request.prompt_token_ids) - request.num_computed_tokens
+                remaining_prompt = len(request.prefill_token_ids) - request.num_computed_tokens
                 chunk_len = min(remaining_prompt, self.prefill_chunk_size, remaining_tokens)
                 if chunk_len > 0:
                     blocks_needed = max(0, math.ceil((request.num_computed_tokens + chunk_len) / block_size) - len(request.block_table))
@@ -43,7 +44,7 @@ class Scheduler:
         i = 0
         while i < len(self.waiting) and available_slots > 0 and remaining_tokens > 0:
             request = self.waiting[i]
-            remaining_prompt = len(request.prompt_token_ids) - request.num_computed_tokens
+            remaining_prompt = len(request.prefill_token_ids) - request.num_computed_tokens
             if remaining_prompt <= 0:
                 raise ValueError(f"No prompt tokens remain to prefill: request_id: {request.request_id}, num_computed_tokens: {request.num_computed_tokens}")
             max_fitting_tokens = max(0, free_blocks - reserved_blocks) * block_size
