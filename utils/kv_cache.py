@@ -93,6 +93,7 @@ class PagedKVCache:
         self.num_allocated_blocks = 0
         self.cacheable_blocks = set()
         self.block_hashes = {}
+        self.hash_to_block_id = {}
 
     def add_cacheable_block(self, block_id):
         if block_id not in self.allocated_blocks:
@@ -106,6 +107,19 @@ class PagedKVCache:
             raise KVCacheStateError(f"Block {block_id} cannot be retained, it is not allocated")
         self.block_references[block_id] += 1
     
+    def share_block(self, digest, new_request_block_table):
+        block_id = self.hash_to_block_id.get(digest, None)
+        if block_id is None or block_id not in self.allocated_blocks or block_id not in self.cacheable_blocks:
+            return None
+        block_id_digest = self.block_hashes.get(block_id, None)
+        if block_id_digest is None or block_id_digest != digest:
+            return None
+        if block_id in new_request_block_table:
+            raise ValueError("One request must not list the same physical block table twice")
+        self.retain_block(block_id)
+        new_request_block_table.append(block_id)
+        return block_id
+
     def free_block(self, block_id):
         if block_id < 0 or block_id >= self.num_blocks:
             raise ValueError(f"Block id {block_id} is invalid, num_blocks is {self.num_blocks}")
@@ -117,8 +131,11 @@ class PagedKVCache:
             self.num_allocated_blocks -= 1
             self.free_blocks.append(block_id)
             self.cacheable_blocks.discard(block_id)
+            digest = None
             if block_id in self.block_hashes:
-                del self.block_hashes[block_id]
+                digest = self.block_hashes.pop(block_id, None)
+            if digest is not None and self.hash_to_block_id.get(digest) == block_id:
+                del self.hash_to_block_id[digest]
             self.num_free_blocks += 1
     
     def free_block_table(self, block_table):

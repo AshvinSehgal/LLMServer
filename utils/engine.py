@@ -216,6 +216,8 @@ class Engine:
                 adapter_id = "none"
                 digest = self.hash(parent_hash, tokens, model_identity, adapter_id)
                 self.kv_cache.block_hashes[physical_id] = digest
+                if digest not in self.kv_cache.hash_to_block_id:
+                    self.kv_cache.hash_to_block_id[digest] = physical_id
             if request.num_computed_tokens == len(request.prefill_token_ids):
                 needs_decode_resume = request.needs_decode_resume
                 request.complete_prefill()
