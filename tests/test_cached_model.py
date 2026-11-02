@@ -83,3 +83,34 @@ def test_chunked_prefill_matches_full_forward_for_different_start_positions():
     torch.testing.assert_close(actual[1, second_batch.last_token_indices[1]], expected_second[0], rtol=1e-5, atol=1e-5)
     assert first_request.block_table == [0, 1, 3]
     assert second_request.block_table == [2, 4]
+
+def test_shared_prefix_prefill_matches_full_forward_without_overwriting_first_request():
+    torch.manual_seed(42)
+    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6).eval()
+    cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
+    first_request = Request("req-1", "", [1, 2, 3, 4, 5, 6], 2, None)
+    second_request = Request("req-2", "", [1, 2, 3, 4, 7, 8], 2, None)
+    first_request.start_prefill()
+    first_batch = PrefillBatch([first_request], pad_token_id=0, device=torch.device("cpu"), dtype=torch.float32)
+    with torch.inference_mode():
+        model(first_batch.input_ids, first_batch.pos_ids, first_batch.attention_mask, kv_cache_manager=cache, request_ids=first_batch.request_ids, block_tables=first_batch.block_tables, start_pos=first_batch.start_pos, input_lens=first_batch.input_lens)
+        expected_second = model(torch.tensor([second_request.prompt_token_ids]))[:, -1]
+    original_keys, original_values = cache.get(layer_index=0, block_table=first_request.block_table, end_pos=6)
+    original_keys = original_keys.clone()
+    original_values = original_values.clone()
+    for block_id, digest in zip(first_request.block_table[:2], ["block-0", "block-1"]):
+        cache.add_cacheable_block(block_id)
+        cache.block_hashes[block_id] = digest
+        cache.hash_to_block_id[digest] = block_id
+        assert cache.share_block(digest, second_request.block_table) == block_id
+        second_request.num_computed_tokens += 2
+    second_request.start_prefill()
+    second_batch = PrefillBatch([second_request], pad_token_id=0, device=torch.device("cpu"), dtype=torch.float32)
+    with torch.inference_mode():
+        actual_second = model(second_batch.input_ids, second_batch.pos_ids, second_batch.attention_mask, kv_cache_manager=cache, request_ids=second_batch.request_ids, block_tables=second_batch.block_tables, start_pos=second_batch.start_pos, input_lens=second_batch.input_lens)
+    torch.testing.assert_close(actual_second[0, second_batch.last_token_indices[0]], expected_second[0], rtol=1e-5, atol=1e-5)
+    current_keys, current_values = cache.get(layer_index=0, block_table=first_request.block_table, end_pos=6)
+    torch.testing.assert_close(current_keys, original_keys, rtol=0, atol=0)
+    torch.testing.assert_close(current_values, original_values, rtol=0, atol=0)
+    assert first_request.block_table == [0, 1, 2]
+    assert second_request.block_table == [0, 1, 3]

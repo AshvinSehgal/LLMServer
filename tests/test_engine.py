@@ -147,6 +147,55 @@ def test_engine_hashes_complete_blocks_with_parent_prefix(first_prompt, second_p
         second_hash = engine.kv_cache.block_hashes[second_request.block_table[logical_block]]
         assert (first_hash == second_hash) == expected_match
 
+@pytest.mark.parametrize(("prompt_length", "expected_shared_blocks"), [(4, 0), (8, 1), (10, 2)])
+def test_engine_reuses_longest_cached_prefix_before_prefill(prompt_length, expected_shared_blocks):
+    prompt_token_ids = list(range(10, 10 + prompt_length))
+    model = Model(token_ids_by_call=[[50], [51], [60]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=prompt_token_ids), max_new_tokens=3, max_batch_size=2, max_num_batched_tokens=12, kv_cache_num_blocks=6, kv_cache_block_size=4)
+    first_request = engine.add_request("First")
+    assert engine.step()
+    allocated_before = engine.kv_cache.num_allocated_blocks
+    second_request = engine.add_request("Second")
+    assert second_request.status == RequestStatus.WAITING
+    assert second_request.block_table == first_request.block_table[:expected_shared_blocks]
+    assert second_request.num_computed_tokens == expected_shared_blocks * 4
+    assert engine.kv_cache.num_allocated_blocks == allocated_before
+    for block_id in second_request.block_table:
+        assert engine.kv_cache.block_references[block_id] == 2
+    assert engine.step()
+    assert model.calls[-1]["request_ids"] == [second_request.request_id]
+    assert model.calls[-1]["input_ids"] == [prompt_token_ids[expected_shared_blocks * 4:]]
+    assert model.calls[-1]["start_pos"] == [expected_shared_blocks * 4]
+    assert second_request.num_computed_tokens == prompt_length
+    assert second_request.generated_token_ids == [60]
+
+@pytest.mark.parametrize(("second_prompt", "expected_shared_blocks"), [([99, 11, 12, 13, 20, 21, 22, 23, 30, 31], 0), ([10, 11, 12, 13, 99, 21, 22, 23, 30, 31], 1)])
+def test_engine_stops_cached_prefix_at_first_miss(second_prompt, expected_shared_blocks):
+    first_prompt = [10, 11, 12, 13, 20, 21, 22, 23, 30, 31]
+    model = Model(token_ids_by_call=[[50]])
+    tokenizer = Tokenizer(bos_token_id=3, prompt_token_ids={"First": first_prompt, "Second": second_prompt})
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=3, max_batch_size=2, max_num_batched_tokens=12, kv_cache_num_blocks=6, kv_cache_block_size=4)
+    first_request = engine.add_request("First")
+    assert engine.step()
+    second_request = engine.add_request("Second")
+    assert second_request.block_table == first_request.block_table[:expected_shared_blocks]
+    assert second_request.num_computed_tokens == expected_shared_blocks * 4
+    assert engine.kv_cache.block_references[first_request.block_table[0]] == (2 if expected_shared_blocks else 1)
+
+def test_engine_cancelling_waiting_request_releases_shared_prefix_references():
+    model = Model(token_ids_by_call=[[50]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=list(range(10, 20))), max_new_tokens=3, max_batch_size=2, max_num_batched_tokens=12, kv_cache_num_blocks=6, kv_cache_block_size=4)
+    first_request = engine.add_request("First")
+    assert engine.step()
+    second_request = engine.add_request("Second")
+    shared_blocks = second_request.block_table.copy()
+    assert len(shared_blocks) == 2
+    assert engine.cancel_request(second_request.request_id)
+    assert second_request.block_table == []
+    assert first_request.status == RequestStatus.DECODING
+    assert all(engine.kv_cache.block_references[block_id] == 1 for block_id in shared_blocks)
+    assert all(block_id in engine.kv_cache.allocated_blocks for block_id in shared_blocks)
+
 def test_engine_releases_cacheable_markers_when_request_finishes():
     model = Model(token_ids_by_call=[[50]])
     engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=[10, 11, 12, 13]), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=4, kv_cache_num_blocks=2, kv_cache_block_size=4)

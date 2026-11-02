@@ -79,6 +79,19 @@ class Engine:
         payload = json.dumps([parent_hash, tokens, model_identity, adapter_id], separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
+    def find_longest_cached_prefix(self, request):
+        parent_hash = "root"
+        max_blocks_to_try = (len(request.prompt_token_ids) - 1) // self.block_size
+        for logical_block in range(max_blocks_to_try):
+            block_start_idx = logical_block * self.block_size
+            tokens = request.prompt_token_ids[block_start_idx: block_start_idx + self.block_size]
+            digest = self.hash(parent_hash, tokens, self.model.name, "none")
+            block_id = self.kv_cache.share_block(digest, request.block_table)
+            if block_id is None:
+                break
+            request.num_computed_tokens += self.block_size
+            parent_hash = digest
+
     def add_request(self, prompt):
         self.prune_completed_requests()
         if not prompt or prompt.strip() == "":
@@ -89,6 +102,7 @@ class Engine:
         output_queue = asyncio.Queue()
         request = Request(request_id, prompt, prompt_token_ids, self.max_new_tokens, output_queue)
         self.active_requests[request.request_id] = request
+        self.find_longest_cached_prefix(request)
         self.scheduler.waiting.append(request)
         return request
 
