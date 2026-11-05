@@ -114,3 +114,43 @@ def test_shared_prefix_prefill_matches_full_forward_without_overwriting_first_re
     torch.testing.assert_close(current_values, original_values, rtol=0, atol=0)
     assert first_request.block_table == [0, 1, 2]
     assert second_request.block_table == [0, 1, 3]
+
+def test_shared_prefix_requests_decode_different_continuations_without_overwriting_each_other():
+    torch.manual_seed(42)
+    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6).eval()
+    cache = PagedKVCache(num_layers=2, num_blocks=3, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
+    first_request = Request("req-1", "", [1, 2, 3], 2, None)
+    second_request = Request("req-2", "", [1, 2, 4], 2, None)
+    first_request.start_prefill()
+    first_batch = PrefillBatch([first_request], pad_token_id=0, device=torch.device("cpu"), dtype=torch.float32)
+    with torch.inference_mode():
+        model(first_batch.input_ids, first_batch.pos_ids, first_batch.attention_mask, kv_cache_manager=cache, request_ids=first_batch.request_ids, block_tables=first_batch.block_tables, start_pos=first_batch.start_pos, input_lens=first_batch.input_lens)
+    first_request.advance_prefill(3)
+    first_request.complete_prefill()
+    shared_block = first_request.block_table[0]
+    cache.add_cacheable_block(shared_block)
+    cache.block_hashes[shared_block] = "shared-prefix"
+    cache.hash_to_block_id["shared-prefix"] = shared_block
+    assert cache.share_block("shared-prefix", second_request.block_table) == shared_block
+    second_request.num_computed_tokens = 2
+    second_request.start_prefill()
+    second_batch = PrefillBatch([second_request], pad_token_id=0, device=torch.device("cpu"), dtype=torch.float32)
+    with torch.inference_mode():
+        model(second_batch.input_ids, second_batch.pos_ids, second_batch.attention_mask, kv_cache_manager=cache, request_ids=second_batch.request_ids, block_tables=second_batch.block_tables, start_pos=second_batch.start_pos, input_lens=second_batch.input_lens)
+    second_request.advance_prefill(1)
+    second_request.complete_prefill()
+    original_shared = [(cache.key_cache[layer_index, shared_block].clone(), cache.value_cache[layer_index, shared_block].clone()) for layer_index in range(2)]
+    first_request.append_generated_token(5)
+    second_request.append_generated_token(6)
+    decode_batch = DecodeBatch([first_request, second_request], device=torch.device("cpu"), dtype=torch.float32)
+    with torch.inference_mode():
+        actual = model(decode_batch.input_ids, decode_batch.pos_ids, decode_batch.attention_mask, kv_cache_manager=cache, request_ids=decode_batch.request_ids, block_tables=decode_batch.block_tables, start_pos=decode_batch.start_pos, input_lens=decode_batch.input_lens)
+        expected_first = model(torch.tensor([[1, 2, 3, 5]]))[:, -1]
+        expected_second = model(torch.tensor([[1, 2, 4, 6]]))[:, -1]
+    torch.testing.assert_close(actual[0, 0], expected_first[0], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(actual[1, 0], expected_second[0], rtol=1e-5, atol=1e-5)
+    assert first_request.block_table[0] == second_request.block_table[0] == shared_block
+    assert first_request.block_table[1] != second_request.block_table[1]
+    for layer_index, (keys, values) in enumerate(original_shared):
+        torch.testing.assert_close(cache.key_cache[layer_index, shared_block], keys, rtol=0, atol=0)
+        torch.testing.assert_close(cache.value_cache[layer_index, shared_block], values, rtol=0, atol=0)
