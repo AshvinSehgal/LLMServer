@@ -84,6 +84,7 @@ python profile_engine.py --prompt "Explain what a KV cache does in one sentence.
 The profiler also reports peak CUDA memory on CUDA devices. Profiling adds overhead, so use `benchmark.py` for timing comparisons.
 
 On an Apple Silicon Mac, add `--mps-signposts` to `profile_engine.py` to record MPS operation signposts for Xcode Instruments. The profiler warms up on a separate engine instance, then profiles an uncached request on the same model. Keep the regular benchmark for throughput measurements.
+The profiler also labels RMSNorm, paged-cache writes and reads, and direct paged decode attention separately. Their printed CPU total times include nested PyTorch operations; inspect MPS signposts for GPU dispatch timing.
 
 The engine loop does not call `.item()`, `.cpu()` or print GPU tensors per token. Sampling converts one batch of selected token IDs to Python for stopping and streaming; this is an intentional device-to-host boundary. The benchmark synchronizes the device only at measurement boundaries.
 

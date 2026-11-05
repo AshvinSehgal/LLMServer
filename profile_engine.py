@@ -1,11 +1,15 @@
 """Profile one custom-engine generation run by phase and PyTorch operator."""
 import argparse
 import math
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
+from functools import wraps
+from unittest.mock import patch
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 from transformers import AutoTokenizer
+from utils.attention import SelfAttention
 from utils.engine import Engine
+from utils.layers import RMSNorm
 from utils.model_loader import model_loader
 
 
@@ -27,6 +31,27 @@ def mps_profile_context(device, enabled):
     if device.type != "mps":
         raise ValueError("MPS signpost profiling requires an MPS device")
     return torch.mps.profiler.profile(mode="interval", wait_until_completed=False)
+
+
+def profile_wrapper(label, original):
+    @wraps(original)
+    def wrapped(*args, **kwargs):
+        with record_function(label):
+            return original(*args, **kwargs)
+    return wrapped
+
+
+@contextmanager
+def profile_model_operations(engine):
+    with ExitStack() as stack:
+        for module in engine.model.modules():
+            if isinstance(module, RMSNorm):
+                stack.enter_context(patch.object(module, "forward", profile_wrapper("RMSNorm.forward", module.forward)))
+            elif isinstance(module, SelfAttention):
+                stack.enter_context(patch.object(module, "direct_paged_read", profile_wrapper("SelfAttention.direct_paged_read", module.direct_paged_read)))
+        stack.enter_context(patch.object(engine.kv_cache, "append", profile_wrapper("PagedKVCache.append", engine.kv_cache.append)))
+        stack.enter_context(patch.object(engine.kv_cache, "get", profile_wrapper("PagedKVCache.get", engine.kv_cache.get)))
+        yield
 
 
 def main():
@@ -67,14 +92,19 @@ def main():
         torch.cuda.reset_peak_memory_stats(device)
     with mps_profile_context(device, args.mps_signposts):
         with profile(activities=activities, record_shapes=True, profile_memory=True) as profiler:
-            while profiled_step(engine):
-                pass
+            with profile_model_operations(engine):
+                while profiled_step(engine):
+                    pass
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             elif device.type == "mps":
                 torch.mps.synchronize()
     sort_by = "self_device_time_total" if device.type == "cuda" else "self_cpu_time_total"
     print(profiler.key_averages().table(sort_by=sort_by, row_limit=25))
+    print("Engine operation breakdown (CPU total time includes nested operations):")
+    for event in profiler.key_averages():
+        if event.key in ("RMSNorm.forward", "SelfAttention.direct_paged_read", "PagedKVCache.append", "PagedKVCache.get"):
+            print(f"{event.key}: {event.cpu_time_total / 1000:.2f} ms across {event.count} calls")
     if device.type == "cuda":
         print(f"Peak CUDA memory: {torch.cuda.max_memory_allocated(device) / 2 ** 20:.1f} MiB")
     elif device.type == "mps":
