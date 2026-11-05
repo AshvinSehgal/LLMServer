@@ -74,6 +74,14 @@ python benchmark.py --prompt "Explain what a KV cache does in one sentence." --m
 
 The script reports model-loading time separately from generation time, along with time to first token and tokens per second. It runs on CPU when neither MPS nor CUDA is available; the CPU result will be much slower than a GPU result.
 
+To inspect scheduling, prefill, decode and PyTorch operator costs, run:
+
+```bash
+python profile_engine.py --prompt "Explain what a KV cache does in one sentence." --max-new-tokens 32
+```
+
+The profiler also reports peak CUDA memory on CUDA devices. Profiling adds overhead, so use `benchmark.py` for timing comparisons.
+
 ## Development status
 
 The single-request model, custom transformer implementation, multi-request scheduler, paged KV cache, chunked prefill and prefix caching are implemented. The next development version focuses on profiling and faster GPU execution.
