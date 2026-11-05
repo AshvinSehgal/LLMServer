@@ -8,6 +8,7 @@ The project currently targets the Qwen3 architecture and uses Hugging Face only 
 
 - Custom RMSNorm, rotary embeddings, grouped-query self-attention, MLP and decoder layers
 - Full custom transformer forward pass with Hugging Face weight loading
+- Meta-device model construction and direct assignment of pretrained weights to avoid a second CPU weight copy
 - Component and end-to-end parity tests against `Qwen/Qwen3-1.7B`
 - Greedy decoding with EOS and maximum-length stopping
 - Incremental text streaming through `asyncio.Queue`
