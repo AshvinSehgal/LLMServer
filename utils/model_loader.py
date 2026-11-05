@@ -3,7 +3,14 @@ from transformers import AutoModelForCausalLM
 import gc
 from utils.model import Model
 
-def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa=False, decode_attention="direct"):
+def resolve_decode_attention(device, decode_attention):
+    if decode_attention is None:
+        return "gather_sdpa" if torch.device(device).type == "mps" else "direct"
+    if decode_attention not in ("direct", "gather_sdpa"):
+        raise ValueError(f"Unknown decode attention path: {decode_attention}")
+    return decode_attention
+
+def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa=False, decode_attention=None):
     if device is None:
         if torch.backends.mps.is_available():
             device = torch.device("mps")
@@ -11,6 +18,7 @@ def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")
+    decode_attention = resolve_decode_attention(device, decode_attention)
     model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager").eval()
     config = model.config
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)

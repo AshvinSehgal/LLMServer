@@ -59,7 +59,7 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--sdpa", action="store_true", help="Enable scaled dot-product attention for the custom model")
     parser.add_argument("--repeats", type=int, default=1, help="Measure multiple fresh requests per loaded model")
-    parser.add_argument("--decode-attention", choices=("direct", "gather_sdpa"), default="direct", help="Decode attention path for the custom model")
+    parser.add_argument("--decode-attention", choices=("auto", "direct", "gather_sdpa"), default="auto", help="Decode attention path for the custom model")
     parser.add_argument("--compare-decode-attention", action="store_true", help="Measure both decode paths on one loaded custom model")
     args = parser.parse_args()
     if args.max_new_tokens <= 0:
@@ -125,13 +125,13 @@ def main():
     print("\nCustom model", flush=True)
     print("Loading tokenizer and model...", flush=True)
     load_start = time.perf_counter()
-    model = model_loader(args.model, device=device, use_sdpa=args.sdpa, decode_attention=args.decode_attention)
+    model = model_loader(args.model, device=device, use_sdpa=args.sdpa, decode_attention=None if args.decode_attention == "auto" else args.decode_attention)
     synchronize(device)
     load_seconds = time.perf_counter() - load_start
     prompt_length = len(prompt_token_ids)
     block_size = 16
     num_blocks = math.ceil((prompt_length + args.max_new_tokens) / block_size) + 1
-    decode_modes = ("direct", "gather_sdpa") if args.compare_decode_attention else (args.decode_attention,)
+    decode_modes = ("direct", "gather_sdpa") if args.compare_decode_attention else (model.layers[0].self_attn.decode_attention,)
     for decode_mode in decode_modes:
         for module in model.modules():
             if isinstance(module, SelfAttention):

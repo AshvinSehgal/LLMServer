@@ -49,6 +49,7 @@ def profile_model_operations(engine):
                 stack.enter_context(patch.object(module, "forward", profile_wrapper("RMSNorm.forward", module.forward)))
             elif isinstance(module, SelfAttention):
                 stack.enter_context(patch.object(module, "direct_paged_read", profile_wrapper("SelfAttention.direct_paged_read", module.direct_paged_read)))
+                stack.enter_context(patch.object(module, "gather_sdpa_read", profile_wrapper("SelfAttention.gather_sdpa_read", module.gather_sdpa_read)))
         stack.enter_context(patch.object(engine.kv_cache, "append", profile_wrapper("PagedKVCache.append", engine.kv_cache.append)))
         stack.enter_context(patch.object(engine.kv_cache, "get", profile_wrapper("PagedKVCache.get", engine.kv_cache.get)))
         yield
@@ -62,6 +63,7 @@ def main():
     parser.add_argument("--num-requests", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--mps-signposts", action="store_true", help="Record MPS signposts for Xcode Instruments")
+    parser.add_argument("--decode-attention", choices=("auto", "direct", "gather_sdpa"), default="auto", help="Decode attention path for the custom model")
     args = parser.parse_args()
     if args.max_new_tokens <= 0 or args.num_requests <= 0 or args.block_size <= 0:
         parser.error("--max-new-tokens, --num-requests and --block-size must be positive")
@@ -69,7 +71,7 @@ def main():
     if args.mps_signposts and device.type != "mps":
         parser.error("--mps-signposts requires an MPS device")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = model_loader(args.model, device=device)
+    model = model_loader(args.model, device=device, decode_attention=None if args.decode_attention == "auto" else args.decode_attention)
     prompt_length = max(1, len(tokenizer(args.prompt)["input_ids"]))
     blocks_per_request = math.ceil((prompt_length + args.max_new_tokens) / args.block_size) + 1
     engine_kwargs = dict(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=args.num_requests, max_num_batched_tokens=max(128, args.num_requests), kv_cache_num_blocks=blocks_per_request * args.num_requests, kv_cache_block_size=args.block_size)
@@ -103,7 +105,7 @@ def main():
     print(profiler.key_averages().table(sort_by=sort_by, row_limit=25))
     print("Engine operation breakdown (CPU total time includes nested operations):")
     for event in profiler.key_averages():
-        if event.key in ("RMSNorm.forward", "SelfAttention.direct_paged_read", "PagedKVCache.append", "PagedKVCache.get"):
+        if event.key in ("RMSNorm.forward", "SelfAttention.direct_paged_read", "SelfAttention.gather_sdpa_read", "PagedKVCache.append", "PagedKVCache.get"):
             print(f"{event.key}: {event.cpu_time_total / 1000:.2f} ms across {event.count} calls")
     if device.type == "cuda":
         print(f"Peak CUDA memory: {torch.cuda.max_memory_allocated(device) / 2 ** 20:.1f} MiB")

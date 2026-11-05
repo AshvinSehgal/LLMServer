@@ -1,12 +1,14 @@
 import torch
+import pytest
 from utils.batch import PrefillBatch, DecodeBatch
 from utils.kv_cache import PagedKVCache
 from utils.model import Model
 from utils.request import Request
 
-def test_cached_model_decode_matches_full_forward():
+@pytest.mark.parametrize("decode_attention", ["direct", "gather_sdpa"])
+def test_cached_model_decode_matches_full_forward(decode_attention):
     torch.manual_seed(42)
-    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6).eval()
+    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention=decode_attention).eval()
     input_ids = torch.tensor([[1, 2, 3, 4]])
     cache = PagedKVCache(num_layers=2, num_blocks=2, block_size=3, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
     block_table = []
@@ -115,9 +117,10 @@ def test_shared_prefix_prefill_matches_full_forward_without_overwriting_first_re
     assert first_request.block_table == [0, 1, 2]
     assert second_request.block_table == [0, 1, 3]
 
-def test_shared_prefix_requests_decode_different_continuations_without_overwriting_each_other():
+@pytest.mark.parametrize("decode_attention", ["direct", "gather_sdpa"])
+def test_shared_prefix_requests_decode_different_continuations_without_overwriting_each_other(decode_attention):
     torch.manual_seed(42)
-    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6).eval()
+    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention=decode_attention).eval()
     cache = PagedKVCache(num_layers=2, num_blocks=3, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
     first_request = Request("req-1", "", [1, 2, 3], 2, None)
     second_request = Request("req-2", "", [1, 2, 4], 2, None)
@@ -154,3 +157,16 @@ def test_shared_prefix_requests_decode_different_continuations_without_overwriti
     for layer_index, (keys, values) in enumerate(original_shared):
         torch.testing.assert_close(cache.key_cache[layer_index, shared_block], keys, rtol=0, atol=0)
         torch.testing.assert_close(cache.value_cache[layer_index, shared_block], values, rtol=0, atol=0)
+
+def test_gather_sdpa_decode_matches_full_forward_across_block_boundaries():
+    torch.manual_seed(42)
+    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention="gather_sdpa").eval()
+    for sequence_length in (2, 4, 7, 10):
+        input_ids = torch.arange(1, sequence_length + 1).unsqueeze(0)
+        cache = PagedKVCache(num_layers=2, num_blocks=6, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
+        block_table = []
+        with torch.inference_mode():
+            expected = model(input_ids)[:, -1]
+            model(input_ids[:, :-1], kv_cache_manager=cache, request_ids=["req-1"], block_tables=[block_table], start_pos=[0], input_lens=[sequence_length - 1])
+            actual = model(input_ids[:, -1:], pos_ids=torch.tensor([[sequence_length - 1]]), causal_mask=torch.zeros(1, 1, 1, sequence_length), kv_cache_manager=cache, request_ids=["req-1"], block_tables=[block_table], start_pos=[sequence_length - 1], input_lens=[1])[:, -1]
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)

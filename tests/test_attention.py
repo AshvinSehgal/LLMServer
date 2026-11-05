@@ -142,3 +142,24 @@ def test_gather_sdpa_decode_matches_full_attention():
 def test_self_attention_rejects_unknown_decode_path():
     with pytest.raises(ValueError, match="Unknown decode attention path"):
         SelfAttention(hidden_size=8, n_query_heads=4, n_kv_heads=2, head_dim=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention="unknown")
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is not available")
+def test_gather_sdpa_decode_is_close_to_direct_on_mps_bfloat16():
+    torch.manual_seed(42)
+    direct = SelfAttention(hidden_size=8, n_query_heads=4, n_kv_heads=2, head_dim=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6).to(device="mps", dtype=torch.bfloat16).eval()
+    gathered = SelfAttention(hidden_size=8, n_query_heads=4, n_kv_heads=2, head_dim=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention="gather_sdpa").to(device="mps", dtype=torch.bfloat16).eval()
+    gathered.load_state_dict(direct.state_dict())
+    hidden_states = torch.randn(1, 5, 8, device="mps", dtype=torch.bfloat16)
+    positions = torch.arange(5, device="mps").unsqueeze(0)
+    embeddings = RotaryEmbedding(head_dim=2, rope_theta=10000).to("mps")(hidden_states, positions)
+    mask = torch.full((1, 1, 4, 4), torch.finfo(torch.bfloat16).min, device="mps", dtype=torch.bfloat16).triu(diagonal=1)
+    direct_cache = PagedKVCache(num_layers=1, num_blocks=3, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device("mps"), dtype=torch.bfloat16)
+    gathered_cache = PagedKVCache(num_layers=1, num_blocks=3, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device("mps"), dtype=torch.bfloat16)
+    direct_table = []
+    gathered_table = []
+    with torch.inference_mode():
+        direct(hidden_states[:, :4], (embeddings[0][:, :4], embeddings[1][:, :4]), mask, kv_cache=direct_cache, layer_index=0, request_ids=["req-1"], block_tables=[direct_table], start_pos=[0], input_lens=[4])
+        gathered(hidden_states[:, :4], (embeddings[0][:, :4], embeddings[1][:, :4]), mask, kv_cache=gathered_cache, layer_index=0, request_ids=["req-1"], block_tables=[gathered_table], start_pos=[0], input_lens=[4])
+        actual_direct = direct(hidden_states[:, 4:], (embeddings[0][:, 4:], embeddings[1][:, 4:]), torch.zeros(1, 1, 1, 5, device="mps", dtype=torch.bfloat16), kv_cache=direct_cache, layer_index=0, request_ids=["req-1"], block_tables=[direct_table], start_pos=[4], input_lens=[1])
+        actual_gathered = gathered(hidden_states[:, 4:], (embeddings[0][:, 4:], embeddings[1][:, 4:]), torch.zeros(1, 1, 1, 5, device="mps", dtype=torch.bfloat16), kv_cache=gathered_cache, layer_index=0, request_ids=["req-1"], block_tables=[gathered_table], start_pos=[4], input_lens=[1])
+    torch.testing.assert_close(actual_gathered, actual_direct, rtol=5e-2, atol=5e-2)

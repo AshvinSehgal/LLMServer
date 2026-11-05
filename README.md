@@ -89,7 +89,8 @@ The profiler also labels RMSNorm, paged-cache writes and reads, and direct paged
 The engine loop does not call `.item()`, `.cpu()` or print GPU tensors per token. Sampling converts one batch of selected token IDs to Python for stopping and streaming; this is an intentional device-to-host boundary. The benchmark synchronizes the device only at measurement boundaries.
 
 Scaled dot-product attention is available as an opt-in path for full attention and cached prefill: add `--sdpa` to `benchmark.py` to compare it with the default eager path. Direct paged decode remains on its separate path. The eager path remains the default because low-precision SDPA can differ from the Hugging Face eager reference; benchmark and validate token IDs on your target GPU before enabling it by default.
-For decode attention, `--decode-attention gather_sdpa` tests a gather-plus-SDPA alternative. Use `--compare-decode-attention --repeats 3` to compare it with direct paged reads on one loaded custom model. Neither alternative becomes the default until token parity and median MPS speed justify it.
+For decode attention, `--decode-attention gather_sdpa` selects a gather-plus-SDPA alternative. Use `--compare-decode-attention --repeats 3` to compare it with direct paged reads on one loaded custom model.
+The gather-plus-SDPA decode path is now the default when `model_loader()` targets MPS. It matched Hugging Face greedy token IDs and reached 11.27 median decode tokens/s versus 9.93 for direct paged reads in a three-run test on one prompt. CPU and CUDA retain direct paged reads by default; `--decode-attention direct` overrides the MPS choice.
 
 ## Development status
 

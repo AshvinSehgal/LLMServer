@@ -1,6 +1,12 @@
 import torch
 from transformers import AutoModelForCausalLM
-from utils.model_loader import model_loader
+from utils.model_loader import model_loader, resolve_decode_attention
+
+def test_model_loader_selects_mps_decode_attention_by_default():
+    assert resolve_decode_attention(torch.device("mps"), None) == "gather_sdpa"
+    assert resolve_decode_attention(torch.device("cpu"), None) == "direct"
+    assert resolve_decode_attention(torch.device("mps"), "direct") == "direct"
+    assert resolve_decode_attention(torch.device("cpu"), "gather_sdpa") == "gather_sdpa"
 
 def get_hook(outputs, name):
     def hook(module, inputs, output):
