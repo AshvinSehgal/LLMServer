@@ -89,6 +89,7 @@ The profiler also labels RMSNorm, paged-cache writes and reads, and direct paged
 The engine loop does not call `.item()`, `.cpu()` or print GPU tensors per token. Sampling converts one batch of selected token IDs to Python for stopping and streaming; this is an intentional device-to-host boundary. The benchmark synchronizes the device only at measurement boundaries.
 
 Scaled dot-product attention is available as an opt-in path for full attention and cached prefill: add `--sdpa` to `benchmark.py` to compare it with the default eager path. Direct paged decode remains on its separate path. The eager path remains the default because low-precision SDPA can differ from the Hugging Face eager reference; benchmark and validate token IDs on your target GPU before enabling it by default.
+For decode attention, `--decode-attention gather_sdpa` tests a gather-plus-SDPA alternative. Use `--compare-decode-attention --repeats 3` to compare it with direct paged reads on one loaded custom model. Neither alternative becomes the default until token parity and median MPS speed justify it.
 
 ## Development status
 

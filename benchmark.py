@@ -6,6 +6,7 @@ import statistics
 import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+from utils.attention import SelfAttention
 from utils.engine import Engine
 from utils.model_loader import model_loader
 
@@ -58,6 +59,8 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--sdpa", action="store_true", help="Enable scaled dot-product attention for the custom model")
     parser.add_argument("--repeats", type=int, default=1, help="Measure multiple fresh requests per loaded model")
+    parser.add_argument("--decode-attention", choices=("direct", "gather_sdpa"), default="direct", help="Decode attention path for the custom model")
+    parser.add_argument("--compare-decode-attention", action="store_true", help="Measure both decode paths on one loaded custom model")
     args = parser.parse_args()
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
@@ -122,43 +125,48 @@ def main():
     print("\nCustom model", flush=True)
     print("Loading tokenizer and model...", flush=True)
     load_start = time.perf_counter()
-    model = model_loader(args.model, device=device, use_sdpa=args.sdpa)
+    model = model_loader(args.model, device=device, use_sdpa=args.sdpa, decode_attention=args.decode_attention)
     synchronize(device)
     load_seconds = time.perf_counter() - load_start
     prompt_length = len(prompt_token_ids)
     block_size = 16
     num_blocks = math.ceil((prompt_length + args.max_new_tokens) / block_size) + 1
-    warmup_engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=1, max_num_batched_tokens=128, kv_cache_num_blocks=num_blocks, kv_cache_block_size=block_size)
-    print("Warming up...", flush=True)
-    warmup_engine.add_request(args.prompt)
-    while warmup_engine.step():
-        pass
-    synchronize(device)
-    del warmup_engine
-    print(f"Loaded in {load_seconds:.2f} s on {device}. Generating...", flush=True)
-    custom_results = []
-    for _ in range(args.repeats):
-        engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=1, max_num_batched_tokens=128, kv_cache_num_blocks=num_blocks, kv_cache_block_size=block_size)
-        request = engine.add_request(args.prompt)
+    decode_modes = ("direct", "gather_sdpa") if args.compare_decode_attention else (args.decode_attention,)
+    for decode_mode in decode_modes:
+        for module in model.modules():
+            if isinstance(module, SelfAttention):
+                module.decode_attention = decode_mode
+        label = f"Custom model ({decode_mode})" if args.compare_decode_attention else "Custom model"
+        warmup_engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=1, max_num_batched_tokens=128, kv_cache_num_blocks=num_blocks, kv_cache_block_size=block_size)
+        print(f"Warming up {label}...", flush=True)
+        warmup_engine.add_request(args.prompt)
+        while warmup_engine.step():
+            pass
         synchronize(device)
-        generation_start = time.perf_counter()
-        first_token_seconds = None
-        while True:
-            more_work = engine.step()
+        del warmup_engine
+        print(f"Loaded in {load_seconds:.2f} s on {device}. Generating {label}...", flush=True)
+        custom_results = []
+        for _ in range(args.repeats):
+            engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=1, max_num_batched_tokens=128, kv_cache_num_blocks=num_blocks, kv_cache_block_size=block_size)
+            request = engine.add_request(args.prompt)
             synchronize(device)
-            if first_token_seconds is None and request.generated_token_ids:
-                first_token_seconds = time.perf_counter() - generation_start
-            if not more_work:
-                break
-        generation_seconds = time.perf_counter() - generation_start
-        custom_results.append((request.generated_token_ids.copy(), generation_seconds, first_token_seconds))
-    generated_count = len(request.generated_token_ids)
-    response = tokenizer.decode(request.generated_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-
-    print_stats(args.prompt, response, device, args.model, len(request.prompt_token_ids), generated_count, load_seconds, generation_seconds, first_token_seconds)
-    if args.repeats > 1:
-        print_repeated_summary("Custom model", custom_results)
-    print(f"Greedy token IDs match Hugging Face: {all(result[0] == reference_results[0][0] for result in reference_results + custom_results)}")
+            generation_start = time.perf_counter()
+            first_token_seconds = None
+            while True:
+                more_work = engine.step()
+                synchronize(device)
+                if first_token_seconds is None and request.generated_token_ids:
+                    first_token_seconds = time.perf_counter() - generation_start
+                if not more_work:
+                    break
+            generation_seconds = time.perf_counter() - generation_start
+            custom_results.append((request.generated_token_ids.copy(), generation_seconds, first_token_seconds))
+        generated_count = len(request.generated_token_ids)
+        response = tokenizer.decode(request.generated_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        print_stats(args.prompt, response, device, args.model, len(request.prompt_token_ids), generated_count, load_seconds, generation_seconds, first_token_seconds)
+        if args.repeats > 1:
+            print_repeated_summary(label, custom_results)
+        print(f"{label} greedy token IDs match Hugging Face: {all(result[0] == reference_results[0][0] for result in reference_results + custom_results)}")
 
 
 if __name__ == "__main__":

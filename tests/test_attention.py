@@ -1,4 +1,5 @@
 import torch
+import pytest
 from unittest.mock import patch
 from transformers import AutoModelForCausalLM
 from utils.attention import SelfAttention
@@ -119,3 +120,25 @@ def test_sdpa_matches_eager_attention_for_full_and_cached_prefill():
         expected_prefill = eager(hidden_states, embeddings, mask, kv_cache=eager_cache, layer_index=0, request_ids=["req-1"], block_tables=[[]], start_pos=[0], input_lens=[4])
         actual_prefill = sdpa(hidden_states, embeddings, mask, kv_cache=sdpa_cache, layer_index=0, request_ids=["req-1"], block_tables=[[]], start_pos=[0], input_lens=[4])
     torch.testing.assert_close(actual_prefill, expected_prefill, rtol=1e-5, atol=1e-5)
+
+def test_gather_sdpa_decode_matches_full_attention():
+    torch.manual_seed(42)
+    attention = SelfAttention(hidden_size=8, n_query_heads=4, n_kv_heads=2, head_dim=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention="gather_sdpa").eval()
+    rotary_embedding = RotaryEmbedding(head_dim=2, rope_theta=10000)
+    hidden_states = torch.randn(1, 5, 8)
+    positions = torch.arange(5).unsqueeze(0)
+    embeddings = rotary_embedding(hidden_states, positions)
+    full_mask = torch.full((1, 1, 5, 5), torch.finfo(torch.float32).min).triu(diagonal=1)
+    cache = PagedKVCache(num_layers=1, num_blocks=3, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = []
+    with torch.inference_mode():
+        expected = attention(hidden_states, embeddings, full_mask)[:, 4:]
+        attention(hidden_states[:, :4], (embeddings[0][:, :4], embeddings[1][:, :4]), full_mask[:, :, :4, :4], kv_cache=cache, layer_index=0, request_ids=["req-1"], block_tables=[block_table], start_pos=[0], input_lens=[4])
+        with patch.object(attention, "direct_paged_read", side_effect=AssertionError("Gather path must not use direct paged attention")):
+            actual = attention(hidden_states[:, 4:], (embeddings[0][:, 4:], embeddings[1][:, 4:]), torch.zeros(1, 1, 1, 5), kv_cache=cache, layer_index=0, request_ids=["req-1"], block_tables=[block_table], start_pos=[4], input_lens=[1])
+    assert block_table == [0, 1, 2]
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+def test_self_attention_rejects_unknown_decode_path():
+    with pytest.raises(ValueError, match="Unknown decode attention path"):
+        SelfAttention(hidden_size=8, n_query_heads=4, n_kv_heads=2, head_dim=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention="unknown")

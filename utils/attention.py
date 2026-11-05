@@ -4,8 +4,10 @@ import torch.nn.functional as F
 from utils.layers import RMSNorm, apply_rotary_embedding
 
 class SelfAttention(nn.Module):
-    def __init__(self, hidden_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=False):
+    def __init__(self, hidden_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=False, decode_attention="direct"):
         super().__init__()
+        if decode_attention not in ("direct", "gather_sdpa"):
+            raise ValueError(f"Unknown decode attention path: {decode_attention}")
         self.q_proj = nn.Linear(hidden_size, n_query_heads * head_dim, bias=bias)
         self.k_proj = nn.Linear(hidden_size, n_kv_heads * head_dim, bias=bias)
         self.v_proj = nn.Linear(hidden_size, n_kv_heads * head_dim, bias=bias)
@@ -18,6 +20,7 @@ class SelfAttention(nn.Module):
         self.head_dim = head_dim
         self.attention_scaling = attention_scaling
         self.use_sdpa = use_sdpa
+        self.decode_attention = decode_attention
     
     def direct_paged_read(self, request_q, kv_cache, layer_index, block_table, end_pos, group_size):
         query = request_q[0, :, 0, :].float()
@@ -41,6 +44,12 @@ class SelfAttention(nn.Module):
             numerator = numerator * old_weight[:, None] + torch.einsum("ht,thd->hd", weights, values)
             running_max = new_max
         return (numerator / denominator[:, None]).to(request_q.dtype)[None, :, None, :]
+
+    def gather_sdpa_read(self, request_q, kv_cache, layer_index, block_table, end_pos, group_size):
+        cached_keys, cached_values = kv_cache.get(layer_index, block_table, end_pos)
+        cached_keys = cached_keys.repeat_interleave(group_size, dim=0).unsqueeze(0)
+        cached_values = cached_values.repeat_interleave(group_size, dim=0).unsqueeze(0)
+        return F.scaled_dot_product_attention(request_q, cached_keys, cached_values, dropout_p=0.0, scale=self.attention_scaling)
 
     def forward(self, hidden_states, pos_embeddings, causal_mask, kv_cache=None, layer_index=None, request_ids=None, block_tables=None, start_pos=None, input_lens=None):
         Q = self.q_proj(hidden_states)
@@ -85,7 +94,10 @@ class SelfAttention(nn.Module):
                 new_values = V[batch_index, :, :request_input_len, :]
                 kv_cache.append(layer_index, request_block_table, request_start_pos, new_keys, new_values)
                 if request_input_len == 1:
-                    request_attention_scores = self.direct_paged_read(request_q, kv_cache, layer_index, request_block_table, request_end_pos, group_size)
+                    if self.decode_attention == "gather_sdpa":
+                        request_attention_scores = self.gather_sdpa_read(request_q, kv_cache, layer_index, request_block_table, request_end_pos, group_size)
+                    else:
+                        request_attention_scores = self.direct_paged_read(request_q, kv_cache, layer_index, request_block_table, request_end_pos, group_size)
                     attention_scores[batch_index:batch_index + 1, :, :request_input_len, :] = request_attention_scores
                 else:
                     cached_keys, cached_values = kv_cache.get(layer_index, request_block_table, request_end_pos)
