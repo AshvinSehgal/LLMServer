@@ -3,7 +3,7 @@ from transformers import AutoModelForCausalLM
 import gc
 from utils.model import Model
 
-def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None):
+def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa=False):
     if device is None:
         if torch.backends.mps.is_available():
             device = torch.device("mps")
@@ -32,6 +32,7 @@ def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None):
         bias=qwen_attention.q_proj.bias is not None,
         attention_scaling=qwen_attention.scaling,
         rms_norm_eps=config.rms_norm_eps,
+        use_sdpa=use_sdpa,
     ).to(dtype=dtype).eval()
     my_model.name = model_name
     reference_state_dict = model.state_dict()

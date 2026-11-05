@@ -4,10 +4,10 @@ from utils.layers import RMSNorm, RotaryEmbedding, MLP
 from utils.attention import SelfAttention
 
 class DecoderLayer(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps):
+    def __init__(self, hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=False):
         super().__init__()
         self.input_layernorm = RMSNorm(hidden_size, rms_norm_eps)
-        self.self_attn = SelfAttention(hidden_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps)
+        self.self_attn = SelfAttention(hidden_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=use_sdpa)
         self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
         self.mlp = MLP(hidden_size, intermediate_size, bias)
     
@@ -33,12 +33,12 @@ class DecoderLayer(nn.Module):
         return hidden_states
 
 class Model(nn.Module):
-    def __init__(self, vocab_size, hidden_size, intermediate_size, n_hidden_layers, head_dim, rope_theta, n_query_heads, n_kv_heads, bias, attention_scaling, rms_norm_eps):
+    def __init__(self, vocab_size, hidden_size, intermediate_size, n_hidden_layers, head_dim, rope_theta, n_query_heads, n_kv_heads, bias, attention_scaling, rms_norm_eps, use_sdpa=False):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
         self.rotary_embedding = RotaryEmbedding(head_dim, rope_theta)
         self.layers = nn.ModuleList([
-            DecoderLayer(hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps) 
+            DecoderLayer(hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=use_sdpa)
             for _ in range(n_hidden_layers)])
         self.norm = RMSNorm(hidden_size, rms_norm_eps)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)

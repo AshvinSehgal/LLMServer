@@ -99,3 +99,23 @@ def test_direct_paged_read_matches_gather_with_noncontiguous_blocks():
         actual = attention.direct_paged_read(query, cache, 0, block_table, 5, 2)
     assert block_table == [0, 2]
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+def test_sdpa_matches_eager_attention_for_full_and_cached_prefill():
+    torch.manual_seed(42)
+    eager = SelfAttention(hidden_size=8, n_query_heads=4, n_kv_heads=2, head_dim=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6).eval()
+    sdpa = SelfAttention(hidden_size=8, n_query_heads=4, n_kv_heads=2, head_dim=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, use_sdpa=True).eval()
+    sdpa.load_state_dict(eager.state_dict())
+    hidden_states = torch.randn(1, 4, 8)
+    positions = torch.arange(4).unsqueeze(0)
+    embeddings = RotaryEmbedding(head_dim=2, rope_theta=10000)(hidden_states, positions)
+    mask = torch.full((1, 1, 4, 4), torch.finfo(torch.float32).min).triu(diagonal=1)
+    with torch.inference_mode():
+        expected_full = eager(hidden_states, embeddings, mask)
+        actual_full = sdpa(hidden_states, embeddings, mask)
+    torch.testing.assert_close(actual_full, expected_full, rtol=1e-5, atol=1e-5)
+    eager_cache = PagedKVCache(num_layers=1, num_blocks=2, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
+    sdpa_cache = PagedKVCache(num_layers=1, num_blocks=2, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device("cpu"), dtype=torch.float32)
+    with torch.inference_mode():
+        expected_prefill = eager(hidden_states, embeddings, mask, kv_cache=eager_cache, layer_index=0, request_ids=["req-1"], block_tables=[[]], start_pos=[0], input_lens=[4])
+        actual_prefill = sdpa(hidden_states, embeddings, mask, kv_cache=sdpa_cache, layer_index=0, request_ids=["req-1"], block_tables=[[]], start_pos=[0], input_lens=[4])
+    torch.testing.assert_close(actual_prefill, expected_prefill, rtol=1e-5, atol=1e-5)

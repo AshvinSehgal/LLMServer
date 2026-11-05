@@ -46,6 +46,7 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--prompt", default="Explain what a KV cache does in one short sentence.")
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--sdpa", action="store_true", help="Enable scaled dot-product attention for the custom model")
     args = parser.parse_args()
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
@@ -103,7 +104,7 @@ def main():
     print("\nCustom model", flush=True)
     print("Loading tokenizer and model...", flush=True)
     load_start = time.perf_counter()
-    model = model_loader(args.model, device=device)
+    model = model_loader(args.model, device=device, use_sdpa=args.sdpa)
     synchronize(device)
     load_seconds = time.perf_counter() - load_start
     prompt_length = len(prompt_token_ids)

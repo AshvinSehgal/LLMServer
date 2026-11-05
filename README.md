@@ -84,6 +84,8 @@ The profiler also reports peak CUDA memory on CUDA devices. Profiling adds overh
 
 The engine loop does not call `.item()`, `.cpu()` or print GPU tensors per token. Sampling converts one batch of selected token IDs to Python for stopping and streaming; this is an intentional device-to-host boundary. The benchmark synchronizes the device only at measurement boundaries.
 
+Scaled dot-product attention is available as an opt-in path for full attention and cached prefill: add `--sdpa` to `benchmark.py` to compare it with the default eager path. Direct paged decode remains on its separate path. The eager path remains the default because low-precision SDPA can differ from the Hugging Face eager reference; benchmark and validate token IDs on your target GPU before enabling it by default.
+
 ## Development status
 
 The single-request model, custom transformer implementation, multi-request scheduler, paged KV cache, chunked prefill and prefix caching are implemented. The next development version focuses on profiling and faster GPU execution.
