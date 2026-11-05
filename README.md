@@ -82,6 +82,8 @@ python profile_engine.py --prompt "Explain what a KV cache does in one sentence.
 
 The profiler also reports peak CUDA memory on CUDA devices. Profiling adds overhead, so use `benchmark.py` for timing comparisons.
 
+On an Apple Silicon Mac, add `--mps-signposts` to `profile_engine.py` to record MPS operation signposts for Xcode Instruments. The profiler warms up on a separate engine instance, then profiles an uncached request on the same model. Keep the regular benchmark for throughput measurements.
+
 The engine loop does not call `.item()`, `.cpu()` or print GPU tensors per token. Sampling converts one batch of selected token IDs to Python for stopping and streaming; this is an intentional device-to-host boundary. The benchmark synchronizes the device only at measurement boundaries.
 
 Scaled dot-product attention is available as an opt-in path for full attention and cached prefill: add `--sdpa` to `benchmark.py` to compare it with the default eager path. Direct paged decode remains on its separate path. The eager path remains the default because low-precision SDPA can differ from the Hugging Face eager reference; benchmark and validate token IDs on your target GPU before enabling it by default.
