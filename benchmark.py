@@ -2,6 +2,7 @@
 import argparse
 import gc
 import math
+import statistics
 import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
@@ -41,15 +42,27 @@ def print_stats(prompt, response, device, model_name, prompt_count, generated_co
         print(f"Decode throughput: {(generated_count - 1) / (generation_seconds - first_token_seconds):.2f} tokens/s")
 
 
+def print_repeated_summary(label, results):
+    generation_times = [result[1] for result in results]
+    first_token_times = [result[2] for result in results]
+    decode_speeds = [(len(result[0]) - 1) / (result[1] - result[2]) for result in results if len(result[0]) > 1]
+    print(f"{label} median over {len(results)} runs: Generation: {statistics.median(generation_times):.2f} s | Time to first token: {statistics.median(first_token_times):.2f} s")
+    if decode_speeds:
+        print(f"{label} median decode throughput: {statistics.median(decode_speeds):.2f} tokens/s")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark one prompt with Hugging Face Transformers and the custom LLM engine.")
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--prompt", default="Explain what a KV cache does in one short sentence.")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--sdpa", action="store_true", help="Enable scaled dot-product attention for the custom model")
+    parser.add_argument("--repeats", type=int, default=1, help="Measure multiple fresh requests per loaded model")
     args = parser.parse_args()
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
+    if args.repeats <= 0:
+        parser.error("--repeats must be positive")
 
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -79,18 +92,23 @@ def main():
     synchronize(device)
 
     print(f"Loaded in {load_seconds:.2f} s on {device}. Generating...", flush=True)
-    synchronize(device)
-    generation_start = time.perf_counter()
-    timer = FirstTokenTimer(device, generation_start)
-    with torch.inference_mode():
-        output_ids = reference_model.generate(input_ids=input_ids, max_new_tokens=args.max_new_tokens, do_sample=False, use_cache=True, stopping_criteria=StoppingCriteriaList([timer]))
-    synchronize(device)
-    generation_seconds = time.perf_counter() - generation_start
-    if timer.first_token_seconds is None:
-        raise RuntimeError("Hugging Face generation did not report a first token")
-    generated_ids = output_ids[0, input_ids.shape[1]:].tolist()
+    reference_results = []
+    for _ in range(args.repeats):
+        synchronize(device)
+        generation_start = time.perf_counter()
+        timer = FirstTokenTimer(device, generation_start)
+        with torch.inference_mode():
+            output_ids = reference_model.generate(input_ids=input_ids, max_new_tokens=args.max_new_tokens, do_sample=False, use_cache=True, stopping_criteria=StoppingCriteriaList([timer]))
+        synchronize(device)
+        generation_seconds = time.perf_counter() - generation_start
+        if timer.first_token_seconds is None:
+            raise RuntimeError("Hugging Face generation did not report a first token")
+        generated_ids = output_ids[0, input_ids.shape[1]:].tolist()
+        reference_results.append((generated_ids, generation_seconds, timer.first_token_seconds))
     response = tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     print_stats(args.prompt, response, device, args.model, len(prompt_token_ids), len(generated_ids), load_seconds, generation_seconds, timer.first_token_seconds)
+    if args.repeats > 1:
+        print_repeated_summary("Hugging Face", reference_results)
 
     del reference_model
     del output_ids
@@ -117,25 +135,30 @@ def main():
         pass
     synchronize(device)
     del warmup_engine
-    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=1, max_num_batched_tokens=128, kv_cache_num_blocks=num_blocks, kv_cache_block_size=block_size)
-    request = engine.add_request(args.prompt)
-
     print(f"Loaded in {load_seconds:.2f} s on {device}. Generating...", flush=True)
-    synchronize(device)
-    generation_start = time.perf_counter()
-    first_token_seconds = None
-    while True:
-        more_work = engine.step()
+    custom_results = []
+    for _ in range(args.repeats):
+        engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=1, max_num_batched_tokens=128, kv_cache_num_blocks=num_blocks, kv_cache_block_size=block_size)
+        request = engine.add_request(args.prompt)
         synchronize(device)
-        if first_token_seconds is None and request.generated_token_ids:
-            first_token_seconds = time.perf_counter() - generation_start
-        if not more_work:
-            break
-    generation_seconds = time.perf_counter() - generation_start
+        generation_start = time.perf_counter()
+        first_token_seconds = None
+        while True:
+            more_work = engine.step()
+            synchronize(device)
+            if first_token_seconds is None and request.generated_token_ids:
+                first_token_seconds = time.perf_counter() - generation_start
+            if not more_work:
+                break
+        generation_seconds = time.perf_counter() - generation_start
+        custom_results.append((request.generated_token_ids.copy(), generation_seconds, first_token_seconds))
     generated_count = len(request.generated_token_ids)
     response = tokenizer.decode(request.generated_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
     print_stats(args.prompt, response, device, args.model, len(request.prompt_token_ids), generated_count, load_seconds, generation_seconds, first_token_seconds)
+    if args.repeats > 1:
+        print_repeated_summary("Custom model", custom_results)
+    print(f"Greedy token IDs match Hugging Face: {all(result[0] == reference_results[0][0] for result in reference_results + custom_results)}")
 
 
 if __name__ == "__main__":

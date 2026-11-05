@@ -73,6 +73,7 @@ python benchmark.py --prompt "Explain what a KV cache does in one sentence." --m
 ```
 
 The script reports model-loading time separately from generation time, along with time to first token and tokens per second. It runs on CPU when neither MPS nor CUDA is available; the CPU result will be much slower than a GPU result.
+Use `--repeats 3` to report median generation, time-to-first-token and decode throughput without reloading each model. Each custom measurement uses a fresh engine so prefix-cache hits cannot affect the comparison. The benchmark also reports whether generated greedy token IDs match Hugging Face.
 
 To inspect scheduling, prefill, decode and PyTorch operator costs, run:
 
