@@ -221,10 +221,14 @@ def test_paged_kv_cache_share_block_reuses_values_and_releases_on_last_reference
     cache.free_block_table(third_block_table)
     cache.free_block_table(second_block_table)
     assert cache.block_references[block_id] == 0
-    assert cache.allocated_blocks == set()
-    assert cache.cacheable_blocks == set()
-    assert cache.block_hashes == {}
-    assert cache.hash_to_block_id == {}
+    assert cache.allocated_blocks == {block_id}
+    assert cache.cacheable_blocks == {block_id}
+    assert cache.block_hashes == {block_id: "shared-prefix"}
+    assert cache.hash_to_block_id == {"shared-prefix": block_id}
+    assert list(cache.idle_lru) == [block_id]
+    assert cache.share_block("shared-prefix", first_block_table) == block_id
+    assert list(cache.idle_lru) == []
+    assert cache.block_references[block_id] == 1
 
 def test_paged_kv_cache_share_block_misses_without_valid_cache_entry():
     cache = PagedKVCache(num_layers=1, num_blocks=2, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
@@ -273,7 +277,47 @@ def test_paged_kv_cache_frees_only_matching_hash_lookup():
     cache.free_block(second_block_id)
     assert cache.hash_to_block_id == {"prefix": first_block_id}
     cache.free_block(first_block_id)
-    assert cache.hash_to_block_id == {}
+    assert cache.hash_to_block_id == {"prefix": first_block_id}
+    assert list(cache.idle_lru) == [first_block_id]
+
+def test_paged_kv_cache_evicts_oldest_idle_block_only_when_needed():
+    cache = PagedKVCache(num_layers=1, num_blocks=3, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_ids = [cache.allocate_block() for _ in range(3)]
+    for block_id in block_ids:
+        cache.add_cacheable_block(block_id)
+        cache.block_hashes[block_id] = f"prefix-{block_id}"
+        cache.hash_to_block_id[f"prefix-{block_id}"] = block_id
+    cache.free_block(block_ids[0])
+    cache.free_block(block_ids[1])
+    assert list(cache.idle_lru) == block_ids[:2]
+    assert cache.num_free_blocks == 0
+    assert cache.allocate_block() == block_ids[0]
+    assert list(cache.idle_lru) == [block_ids[1]]
+    assert cache.share_block(f"prefix-{block_ids[0]}", []) is None
+    assert cache.hash_to_block_id == {f"prefix-{block_ids[1]}": block_ids[1], f"prefix-{block_ids[2]}": block_ids[2]}
+    assert cache.block_references[block_ids[2]] == 1
+
+def test_paged_kv_cache_prefers_free_block_before_evicting_idle_block():
+    cache = PagedKVCache(num_layers=1, num_blocks=2, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_id = cache.allocate_block()
+    cache.add_cacheable_block(block_id)
+    cache.block_hashes[block_id] = "prefix"
+    cache.hash_to_block_id["prefix"] = block_id
+    cache.free_block(block_id)
+    assert cache.allocate_block() != block_id
+    assert cache.share_block("prefix", []) == block_id
+
+def test_paged_kv_cache_cannot_release_idle_block_twice():
+    cache = PagedKVCache(num_layers=1, num_blocks=1, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_id = cache.allocate_block()
+    cache.add_cacheable_block(block_id)
+    cache.block_hashes[block_id] = "prefix"
+    cache.hash_to_block_id["prefix"] = block_id
+    cache.free_block(block_id)
+    with pytest.raises(KVCacheStateError):
+        cache.free_block(block_id)
+    assert cache.block_references[block_id] == 0
+    assert list(cache.idle_lru) == [block_id]
 
 def test_paged_kv_cache_shared_prefix_and_private_block_release_independently():
     cache = PagedKVCache(num_layers=1, num_blocks=3, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)

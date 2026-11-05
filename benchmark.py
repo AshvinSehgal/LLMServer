@@ -109,12 +109,14 @@ def main():
     prompt_length = len(prompt_token_ids)
     block_size = 16
     num_blocks = math.ceil((prompt_length + args.max_new_tokens) / block_size) + 1
-    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=1, max_num_batched_tokens=128, kv_cache_num_blocks=num_blocks, kv_cache_block_size=block_size)
+    warmup_engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=1, max_num_batched_tokens=128, kv_cache_num_blocks=num_blocks, kv_cache_block_size=block_size)
     print("Warming up...", flush=True)
-    engine.add_request(args.prompt)
-    while engine.step():
+    warmup_engine.add_request(args.prompt)
+    while warmup_engine.step():
         pass
     synchronize(device)
+    del warmup_engine
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=1, max_num_batched_tokens=128, kv_cache_num_blocks=num_blocks, kv_cache_block_size=block_size)
     request = engine.add_request(args.prompt)
 
     print(f"Loaded in {load_seconds:.2f} s on {device}. Generating...", flush=True)

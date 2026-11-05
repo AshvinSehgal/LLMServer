@@ -1,5 +1,5 @@
 import torch
-from collections import deque
+from collections import deque, OrderedDict
 import math
 class ContiguousKVCache:
     def __init__(self, num_layers, num_kv_heads, max_seq_length, head_dim, device, dtype):
@@ -94,6 +94,7 @@ class PagedKVCache:
         self.cacheable_blocks = set()
         self.block_hashes = {}
         self.hash_to_block_id = {}
+        self.idle_lru = OrderedDict()
 
     def add_cacheable_block(self, block_id):
         if block_id not in self.allocated_blocks:
@@ -105,6 +106,8 @@ class PagedKVCache:
             raise ValueError(f"Block id {block_id} is invalid, num_blocks is {self.num_blocks}")
         if block_id not in self.allocated_blocks:
             raise KVCacheStateError(f"Block {block_id} cannot be retained, it is not allocated")
+        if self.block_references[block_id] == 0:
+            self.idle_lru.pop(block_id, None)
         self.block_references[block_id] += 1
     
     def share_block(self, digest, new_request_block_table):
@@ -125,24 +128,35 @@ class PagedKVCache:
             raise ValueError(f"Block id {block_id} is invalid, num_blocks is {self.num_blocks}")
         if block_id not in self.allocated_blocks:
             raise KVCacheStateError(f"Block {block_id} cannot be freed, it is not allocated")
-        self.block_references[block_id] -= 1
         if self.block_references[block_id] == 0:
-            self.allocated_blocks.discard(block_id)
-            self.num_allocated_blocks -= 1
-            self.free_blocks.append(block_id)
-            self.cacheable_blocks.discard(block_id)
-            digest = None
-            if block_id in self.block_hashes:
-                digest = self.block_hashes.pop(block_id, None)
-            if digest is not None and self.hash_to_block_id.get(digest) == block_id:
-                del self.hash_to_block_id[digest]
-            self.num_free_blocks += 1
+            raise KVCacheStateError(f"Block {block_id} cannot be freed, it has no active references")
+        self.block_references[block_id] -= 1
+        if self.block_references[block_id] > 0:
+            return
+        digest = self.block_hashes.get(block_id)
+        if block_id in self.cacheable_blocks and digest is not None and self.hash_to_block_id.get(digest) == block_id:
+            self.idle_lru[block_id] = digest
+            return
+        self.discard_block(block_id)
+
+    def discard_block(self, block_id):
+        self.idle_lru.pop(block_id, None)
+        digest = self.block_hashes.pop(block_id, None)
+        if digest is not None and self.hash_to_block_id.get(digest) == block_id:
+            del self.hash_to_block_id[digest]
+        self.allocated_blocks.discard(block_id)
+        self.num_allocated_blocks -= 1
+        self.free_blocks.append(block_id)
+        self.cacheable_blocks.discard(block_id)
+        self.num_free_blocks += 1
     
     def free_block_table(self, block_table):
         unique_blocks = set()
         for block_id in block_table:
             if block_id not in self.allocated_blocks:
                 raise KVCacheStateError(f"Block {block_id} cannot be freed, it is not allocated")
+            if self.block_references[block_id] == 0:
+                raise KVCacheStateError(f"Block {block_id} cannot be freed, it has no active references")
             if block_id in unique_blocks:
                 raise ValueError(f"Duplicate block id {block_id} found")
             unique_blocks.add(block_id)
@@ -152,7 +166,10 @@ class PagedKVCache:
     
     def allocate_block(self):
         if not self.free_blocks:
-            raise KVCacheExhaustedError(f"KV Cache is out of blocks: num_blocks: {self.num_blocks}, num_free_blocks: {self.num_free_blocks}")
+            if not self.idle_lru:
+                raise KVCacheExhaustedError(f"KV Cache is out of blocks: num_blocks: {self.num_blocks}, num_free_blocks: {self.num_free_blocks}")
+            oldest_block_id = next(iter(self.idle_lru))
+            self.discard_block(oldest_block_id)
         free_cache_block = self.free_blocks.popleft()
         self.num_free_blocks -= 1
         self.allocated_blocks.add(free_cache_block)

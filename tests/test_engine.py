@@ -196,14 +196,29 @@ def test_engine_cancelling_waiting_request_releases_shared_prefix_references():
     assert all(engine.kv_cache.block_references[block_id] == 1 for block_id in shared_blocks)
     assert all(block_id in engine.kv_cache.allocated_blocks for block_id in shared_blocks)
 
-def test_engine_releases_cacheable_markers_when_request_finishes():
+def test_engine_retains_cacheable_markers_when_request_finishes():
     model = Model(token_ids_by_call=[[50]])
     engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=[10, 11, 12, 13]), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=4, kv_cache_num_blocks=2, kv_cache_block_size=4)
     request = engine.add_request("Hello")
     assert not engine.step()
     assert request.block_table == []
-    assert engine.kv_cache.cacheable_blocks == set()
-    assert engine.kv_cache.block_hashes == {}
+    assert engine.kv_cache.cacheable_blocks == {0}
+    assert 0 in engine.kv_cache.block_hashes
+    assert list(engine.kv_cache.idle_lru) == [0]
+    assert engine.kv_cache.num_free_blocks == 1
+
+def test_engine_schedules_prefill_by_evicting_idle_prefix_block():
+    model = Model(token_ids_by_call=[[50], [50], [50]])
+    prompts = {"First": [10, 11, 12, 13], "Second": [20, 21, 22, 23], "Third": [30, 31, 32, 33]}
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3, prompt_token_ids=prompts), max_new_tokens=1, max_batch_size=1, max_num_batched_tokens=4, kv_cache_num_blocks=2, kv_cache_block_size=4)
+    for prompt in prompts:
+        request = engine.add_request(prompt)
+        assert not engine.step()
+        assert request.status == RequestStatus.FINISHED
+    assert engine.kv_cache.num_free_blocks == 0
+    assert len(engine.kv_cache.idle_lru) == 2
+    first_hash = engine.hash("root", prompts["First"], model.name, "none")
+    assert first_hash not in engine.kv_cache.hash_to_block_id
 
 def test_engine_decode_and_length_stopping_streams_incremental_text():
     model = Model(token_ids_by_call=[[50], [51]])

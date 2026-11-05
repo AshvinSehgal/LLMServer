@@ -254,12 +254,13 @@ class Engine:
 
     def schedule_step(self):
         while True:
-            scheduler_output = self.scheduler.plan(self.kv_cache.num_free_blocks, self.block_size)
+            available_blocks = self.kv_cache.num_free_blocks + len(self.kv_cache.idle_lru)
+            scheduler_output = self.scheduler.plan(available_blocks, self.block_size)
             decode_requests = scheduler_output.decode_requests
             prefill_requests = scheduler_output.prefill_requests
             num_blocks_needed = sum(max(0, math.ceil((request.num_computed_tokens + chunk_len) / self.kv_cache.block_size) - len(request.block_table)) for request, chunk_len in zip(prefill_requests, scheduler_output.prefill_token_counts))
             num_blocks_needed += sum(max(0, math.ceil((request.num_computed_tokens + 1) / self.kv_cache.block_size) - len(request.block_table)) for request in decode_requests)
-            if num_blocks_needed <= self.kv_cache.num_free_blocks:
+            if num_blocks_needed <= available_blocks:
                 self.scheduler.commit(scheduler_output)
                 return scheduler_output
             if len(self.scheduler.running) == 1:
