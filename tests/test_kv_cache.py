@@ -69,6 +69,31 @@ def test_paged_kv_cache_layout():
     assert cache.key_cache[1, 2, 3].shape == (3, 4)
     assert cache.value_cache[1, 2, 3].shape == (3, 4)
 
+def test_paged_kv_cache_contiguous_read_matches_fallback_and_reflects_cache():
+    cache = PagedKVCache(num_layers=1, num_blocks=4, block_size=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = []
+    keys = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+    values = keys + 100
+    cache.append(0, block_table, 0, keys, values)
+    fast_keys, fast_values = cache.get(0, block_table, 4)
+    cache.contiguous_read_fast_path = False
+    slow_keys, slow_values = cache.get(0, block_table, 4)
+    torch.testing.assert_close(fast_keys, slow_keys)
+    torch.testing.assert_close(fast_values, slow_values)
+    cache.key_cache[0, block_table[0], 0, 0, 0] = 999
+    assert fast_keys[0, 0, 0].item() == 999
+
+def test_paged_kv_cache_fragmented_read_uses_fallback():
+    cache = PagedKVCache(num_layers=1, num_blocks=3, block_size=2, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    assert [cache.allocate_block() for _ in range(3)] == [0, 1, 2]
+    block_table = [0, 2]
+    keys = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+    values = keys + 100
+    cache.append(0, block_table, 0, keys, values)
+    cached_keys, cached_values = cache.get(0, block_table, 4)
+    torch.testing.assert_close(cached_keys, keys)
+    torch.testing.assert_close(cached_values, values)
+
 def test_paged_kv_cache_physical_blocks_are_isolated():
     cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=5, num_kv_heads=3, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
     key_data_ptr = cache.key_cache.data_ptr()
@@ -624,6 +649,18 @@ def test_paged_kv_cache_appends_across_block_boundary():
     assert torch.count_nonzero(cache.key_cache[0, 1, 2:]).item() == 0
     assert torch.count_nonzero(cache.value_cache[0, 1, 2:]).item() == 0
 
+def test_paged_kv_cache_appends_from_middle_of_block_across_multiple_blocks():
+    cache = PagedKVCache(num_layers=1, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    block_table = []
+    first_keys = torch.ones(2, 2, 3)
+    new_keys = torch.arange(42, dtype=torch.float32).reshape(2, 7, 3) + 10
+    cache.append(0, block_table, 0, first_keys, first_keys + 100)
+    cache.append(0, block_table, 2, new_keys, new_keys + 100)
+    cached_keys, cached_values = cache.get(0, block_table, 9)
+    assert block_table == [0, 1, 2]
+    assert torch.equal(cached_keys, torch.cat((first_keys, new_keys), dim=1))
+    assert torch.equal(cached_values, torch.cat((first_keys + 100, new_keys + 100), dim=1))
+
 def test_paged_kv_cache_appends_decode_token_to_existing_block_table():
     cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
     block_table = []
@@ -739,6 +776,46 @@ def test_paged_kv_cache_gets_non_contiguous_physical_blocks_in_logical_order():
     assert block_table == [1, 3]
     assert torch.equal(cached_keys, torch.cat((first_keys, second_keys), dim=1))
     assert torch.equal(cached_values, torch.cat((first_values, second_values), dim=1))
+
+@pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
+def test_paged_kv_cache_get_batch_matches_individual_get_across_blocks(device):
+    cache = PagedKVCache(num_layers=2, num_blocks=6, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device(device), dtype=torch.float32)
+    first_table = []
+    second_table = []
+    for layer_index in range(2):
+        first_keys = torch.arange(36, device=device, dtype=torch.float32).reshape(2, 6, 3) + layer_index * 100
+        second_keys = first_keys + 200
+        cache.append(layer_index, first_table, 0, first_keys, first_keys + 10)
+        cache.append(layer_index, second_table, 0, second_keys, second_keys + 10)
+        for end_pos in (6, 7, 9):
+            if end_pos == 7:
+                cache.append(layer_index, first_table, 6, first_keys[:, :1], first_keys[:, :1] + 10)
+                cache.append(layer_index, second_table, 6, second_keys[:, :1], second_keys[:, :1] + 10)
+            elif end_pos == 9:
+                cache.append(layer_index, first_table, 7, first_keys[:, :2], first_keys[:, :2] + 10)
+                cache.append(layer_index, second_table, 7, second_keys[:, :2], second_keys[:, :2] + 10)
+            batch_keys, batch_values = cache.get_batch(layer_index, [first_table, second_table], end_pos)
+            for row, table in enumerate((first_table, second_table)):
+                keys, values = cache.get(layer_index, table, end_pos)
+                torch.testing.assert_close(batch_keys[row], keys)
+                torch.testing.assert_close(batch_values[row], values)
+    assert first_table != second_table
+
+@pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
+def test_paged_kv_cache_get_batch_ragged_masks_shorter_request(device):
+    cache = PagedKVCache(num_layers=2, num_blocks=5, block_size=2, num_kv_heads=2, head_dim=3, device=torch.device(device), dtype=torch.float32)
+    tables = [[], []]
+    for layer_index in range(2):
+        first = torch.arange(18, device=device, dtype=torch.float32).reshape(2, 3, 3) + layer_index * 100
+        second = torch.arange(30, device=device, dtype=torch.float32).reshape(2, 5, 3) + layer_index * 200
+        cache.append(layer_index, tables[0], 0, first, first + 1)
+        cache.append(layer_index, tables[1], 0, second, second + 1)
+        keys, values, mask = cache.get_batch_ragged(layer_index, tables, [3, 5])
+        assert keys.shape == (2, 2, 5, 3)
+        assert torch.equal(mask[0, 0, 0, 0], torch.tensor([True, True, True, False, False], device=device))
+        assert torch.equal(mask[1, 0, 0, 0], torch.ones(5, device=device, dtype=torch.bool))
+        torch.testing.assert_close(keys[0, :, :3], first)
+        torch.testing.assert_close(values[1], second + 1)
 
 def test_paged_kv_cache_gets_only_requested_layer_and_request():
     cache = PagedKVCache(num_layers=2, num_blocks=4, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)

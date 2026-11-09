@@ -6,15 +6,36 @@ import torch
 import math
 import hashlib
 import json
+import codecs
+from transformers.convert_slow_tokenizer import bytes_to_unicode
 from utils.scheduler import Scheduler
 from utils.request import Request, RequestStatus, RequestFinishReason, CompletedRequest
-from utils.batch import PrefillBatch, DecodeBatch
+from utils.batch import PrefillBatch, PackedPrefillBatch, DecodeBatch
 from utils.kv_cache import PagedKVCache, KVCacheExhaustedError
 
 STREAM_END = None
+BYTE_LEVEL_DECODER = {character: byte for byte, character in bytes_to_unicode().items()}
+MAX_PACKED_PREFILL_TOKENS = 512
+
+class ByteLevelStreamDecoder:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.special_ids = set(tokenizer.all_special_ids)
+        self.byte_decoder = BYTE_LEVEL_DECODER
+        self.utf8_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def push(self, token_id):
+        if token_id in self.special_ids:
+            return ""
+        token = self.tokenizer.convert_ids_to_tokens(token_id)
+        token_bytes = bytes(self.byte_decoder[character] for character in token)
+        return self.utf8_decoder.decode(token_bytes)
+
+    def finish(self):
+        return self.utf8_decoder.decode(b"", final=True)
 
 class Engine:
-    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600, prefill_chunk_size=None, kv_cache_num_blocks=500, kv_cache_block_size=500):
+    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600, prefill_chunk_size=None, kv_cache_num_blocks=500, kv_cache_block_size=500, stream_text=True, prefill_bucketing=True, packed_prefill=True):
         self.model = model
         self.tokenizer = tokenizer
         self.device = next(model.parameters()).device
@@ -28,12 +49,16 @@ class Engine:
         if completed_request_ttl_seconds < 0:
             raise ValueError(f"completed_request_ttl_seconds cannot be negative: {completed_request_ttl_seconds}")
         self.max_new_tokens = max_new_tokens
+        self.stream_text = stream_text
+        self.prefill_bucketing = prefill_bucketing
+        self.packed_prefill = packed_prefill
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_completed_requests = max_completed_requests
         self.completed_request_ttl = timedelta(seconds=completed_request_ttl_seconds)
         self.scheduler = Scheduler(max_batch_size, max_num_batched_tokens, prefill_chunk_size)
         self.active_requests = {}
         self.completed_requests = OrderedDict()
+        self.stream_decoders = {}
         self.num_blocks = kv_cache_num_blocks
         self.block_size = kv_cache_block_size
         config = self.model.config
@@ -74,6 +99,8 @@ class Engine:
             self.eos_token_ids = {eos_token_ids}
         else:
             self.eos_token_ids = set(eos_token_ids)
+        backend = getattr(self.tokenizer, "backend_tokenizer", None)
+        self.byte_level_streaming = backend is not None and type(backend.decoder).__name__ == "ByteLevel" and hasattr(self.tokenizer, "convert_ids_to_tokens")
     
     def hash(self, parent_hash, tokens, model_identity, adapter_id):
         payload = json.dumps([parent_hash, tokens, model_identity, adapter_id], separators=(",", ":")).encode("utf-8")
@@ -101,6 +128,8 @@ class Engine:
         request_id = f"req-{uuid.uuid4()}"
         output_queue = asyncio.Queue()
         request = Request(request_id, prompt, prompt_token_ids, self.max_new_tokens, output_queue)
+        if self.stream_text and self.byte_level_streaming:
+            self.stream_decoders[request_id] = ByteLevelStreamDecoder(self.tokenizer)
         self.active_requests[request.request_id] = request
         self.find_longest_cached_prefix(request)
         self.scheduler.waiting.append(request)
@@ -146,6 +175,7 @@ class Engine:
         if request in self.scheduler.running:
             self.scheduler.running.remove(request)
         request.cancel()
+        self.stream_decoders.pop(request_id, None)
         self.clear_output_queue(request)
         request.output_queue.put_nowait(STREAM_END)
         self.release_request_resources(request)
@@ -153,7 +183,7 @@ class Engine:
         return True
     
     @torch.inference_mode()
-    def process_batch(self, batch):
+    def process_batch(self, batch, logit_rows):
         return self.model(
             batch.input_ids, 
             batch.pos_ids, 
@@ -162,12 +192,14 @@ class Engine:
             request_ids=batch.request_ids,
             block_tables=batch.block_tables,
             start_pos=batch.start_pos,
-            input_lens=batch.input_lens
+            input_lens=batch.input_lens,
+            logit_rows=logit_rows,
+            logit_positions=batch.last_token_indices,
+            packed=getattr(batch, "packed", False)
             )
 
-    def sample_batch(self, logits, batch):
-        last_real_logits = logits[torch.arange(batch.batch_size, device=logits.device), batch.last_token_indices]
-        next_token_ids = torch.argmax(last_real_logits, dim=-1)
+    def sample_batch(self, logits):
+        next_token_ids = torch.argmax(logits, dim=-1)
         return next_token_ids.tolist()
     
     def check_stopping(self, request, token_id):
@@ -177,11 +209,24 @@ class Engine:
             request.finish(RequestFinishReason.LENGTH)
         else:
             return
+        decoder = self.stream_decoders.pop(request.request_id, None)
+        if decoder is not None:
+            trailing_text = decoder.finish()
+            if trailing_text:
+                request.output_queue.put_nowait(trailing_text)
+                request.emitted_text += trailing_text
         request.output_queue.put_nowait(STREAM_END)
         self.release_request_resources(request)
         self.archive_request(request)
     
     def stream_output(self, request):
+        decoder = self.stream_decoders.get(request.request_id)
+        if decoder is not None:
+            new_text = decoder.push(request.generated_token_ids[-1])
+            if new_text:
+                request.output_queue.put_nowait(new_text)
+                request.emitted_text += new_text
+            return
         decoded_text = self.tokenizer.decode(request.generated_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         new_text = decoded_text[len(request.emitted_text):]
         if new_text:
@@ -190,15 +235,16 @@ class Engine:
     
     def accept_generated_token(self, request, token_id):
         request.append_generated_token(token_id)
-        self.stream_output(request)
+        if self.stream_text:
+            self.stream_output(request)
         self.check_stopping(request, token_id)
     
     def process_decode_batch(self, scheduler_output):
         if not scheduler_output.decode_requests:
             return
         decode_batch = DecodeBatch(scheduler_output.decode_requests, self.device, self.dtype)
-        logits = self.process_batch(decode_batch)
-        next_token_ids = self.sample_batch(logits, decode_batch)
+        logits = self.process_batch(decode_batch, list(range(decode_batch.batch_size)))
+        next_token_ids = self.sample_batch(logits)
         for request, token_id in zip(scheduler_output.decode_requests, next_token_ids):
             request.complete_decode()
             self.accept_generated_token(request, token_id)
@@ -207,11 +253,26 @@ class Engine:
         prefill_work = [(request, chunk_len) for request, chunk_len in zip(scheduler_output.prefill_requests, scheduler_output.prefill_token_counts) if request.status == RequestStatus.PREFILL]
         if not prefill_work:
             return
+        lengths = [chunk_len for _, chunk_len in prefill_work]
+        heavy_padding = len(lengths) > 1 and len(lengths) * max(lengths) >= 1.5 * sum(lengths)
+        can_pack = self.packed_prefill and heavy_padding and sum(lengths) <= MAX_PACKED_PREFILL_TOKENS and all(request.num_computed_tokens == 0 for request, _ in prefill_work)
+        if can_pack:
+            self.process_prefill_work(prefill_work, packed=True)
+        elif self.prefill_bucketing and heavy_padding:
+            buckets = {}
+            for request, chunk_len in prefill_work:
+                buckets.setdefault(chunk_len.bit_length(), []).append((request, chunk_len))
+            for bucket in sorted(buckets):
+                self.process_prefill_work(buckets[bucket])
+        else:
+            self.process_prefill_work(prefill_work)
+
+    def process_prefill_work(self, prefill_work, packed=False):
         prefill_requests = [request for request, _ in prefill_work]
         chunk_lengths = [chunk_len for _, chunk_len in prefill_work]
-        prefill_batch = PrefillBatch(prefill_requests, self.pad_token_id, self.device, self.dtype, chunk_lengths=chunk_lengths)
-        logits = self.process_batch(prefill_batch)
-        final_rows = []
+        prefill_batch = PackedPrefillBatch(prefill_requests, self.device, self.dtype, chunk_lengths) if packed else PrefillBatch(prefill_requests, self.pad_token_id, self.device, self.dtype, chunk_lengths=chunk_lengths)
+        final_rows = [row for row, (request, chunk_len) in enumerate(prefill_work) if request.num_computed_tokens + chunk_len == len(request.prefill_token_ids) and not request.needs_decode_resume]
+        logits = self.process_batch(prefill_batch, final_rows)
         for row, (request, chunk_len) in enumerate(prefill_work):
             old_complete = min(request.num_computed_tokens, len(request.prompt_token_ids)) // self.block_size
             request.advance_prefill(chunk_len)
@@ -233,13 +294,9 @@ class Engine:
                 if digest not in self.kv_cache.hash_to_block_id:
                     self.kv_cache.hash_to_block_id[digest] = physical_id
             if request.num_computed_tokens == len(request.prefill_token_ids):
-                needs_decode_resume = request.needs_decode_resume
                 request.complete_prefill()
-                if not needs_decode_resume:
-                    final_rows.append(row)
         if final_rows:
-            final_logits = logits[final_rows, prefill_batch.last_token_indices[final_rows]]
-            next_token_ids = torch.argmax(final_logits, dim=-1).tolist()
+            next_token_ids = self.sample_batch(logits)
             for row, token_id in zip(final_rows, next_token_ids):
                 self.accept_generated_token(prefill_requests[row], token_id)
 

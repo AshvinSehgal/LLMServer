@@ -24,9 +24,10 @@ def test_cached_model_decode_matches_full_forward(decode_attention):
         assert cached_values.shape == (2, 4, 2)
     assert block_table == [0, 1]
 
-def test_multi_request_cached_model_matches_individual_full_forwards():
+@pytest.mark.parametrize("decode_attention", ["direct", "gather_sdpa"])
+def test_multi_request_cached_model_matches_individual_full_forwards(decode_attention):
     torch.manual_seed(42)
-    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6).eval()
+    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention=decode_attention).eval()
     first_request = Request("req-1", "", [1, 2], 2, None)
     second_request = Request("req-2", "", [3, 4, 6, 7], 2, None)
     requests = [first_request, second_request]
@@ -170,3 +171,71 @@ def test_gather_sdpa_decode_matches_full_forward_across_block_boundaries():
             model(input_ids[:, :-1], kv_cache_manager=cache, request_ids=["req-1"], block_tables=[block_table], start_pos=[0], input_lens=[sequence_length - 1])
             actual = model(input_ids[:, -1:], pos_ids=torch.tensor([[sequence_length - 1]]), causal_mask=torch.zeros(1, 1, 1, sequence_length), kv_cache_manager=cache, request_ids=["req-1"], block_tables=[block_table], start_pos=[sequence_length - 1], input_lens=[1])[:, -1]
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+@pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
+def test_model_projects_only_selected_logits_and_skips_intermediate_chunk_projection(device):
+    torch.manual_seed(42)
+    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6).to(device).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], device=device)
+    positions = torch.arange(4, device=device).unsqueeze(0).expand(2, -1)
+    with torch.inference_mode():
+        full_logits = model(input_ids, positions)
+        selected_logits = model(input_ids, positions, logit_rows=[0, 1], logit_positions=torch.tensor([3, 2], device=device))
+        no_logits = model(input_ids, positions, logit_rows=[], logit_positions=torch.tensor([3, 2], device=device))
+    assert selected_logits.shape == (2, 32)
+    assert no_logits.shape == (0, 32)
+    torch.testing.assert_close(selected_logits[0], full_logits[0, 3], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(selected_logits[1], full_logits[1, 2], rtol=1e-5, atol=1e-5)
+
+@pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
+def test_batched_equal_length_decode_matches_per_request_decode(device):
+    torch.manual_seed(42)
+    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention="gather_sdpa").to(device).eval()
+    def decode(batched_decode):
+        for layer in model.layers:
+            layer.self_attn.batched_decode = batched_decode
+        cache = PagedKVCache(num_layers=2, num_blocks=8, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device(device), dtype=torch.float32)
+        block_tables = [[], []]
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]], device=device)
+        with torch.inference_mode():
+            model(input_ids, kv_cache_manager=cache, request_ids=["first", "second"], block_tables=block_tables, start_pos=[0, 0], input_lens=[3, 3])
+            logits = model(torch.tensor([[7], [8]], device=device), pos_ids=torch.tensor([[3], [3]], device=device), causal_mask=torch.zeros(2, 1, 1, 4, device=device), kv_cache_manager=cache, request_ids=["first", "second"], block_tables=block_tables, start_pos=[3, 3], input_lens=[1, 1])
+        return logits, cache, block_tables
+    per_request, _, _ = decode(False)
+    batched, cache, block_tables = decode(True)
+    torch.testing.assert_close(batched, per_request, rtol=1e-5, atol=1e-5)
+    assert block_tables == [[0, 1], [2, 3]]
+    assert cache.num_allocated_blocks == 4
+
+@pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
+def test_batched_mixed_length_decode_matches_per_request_decode(device):
+    torch.manual_seed(42)
+    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention="gather_sdpa").to(device).eval()
+    def decode(batched_decode):
+        for layer in model.layers:
+            layer.self_attn.batched_decode = batched_decode
+        cache = PagedKVCache(num_layers=2, num_blocks=8, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device(device), dtype=torch.float32)
+        tables = [[], []]
+        with torch.inference_mode():
+            model(torch.tensor([[1, 2, 3]], device=device), kv_cache_manager=cache, request_ids=["first"], block_tables=[tables[0]], start_pos=[0], input_lens=[3])
+            model(torch.tensor([[4, 5, 6, 7, 8]], device=device), kv_cache_manager=cache, request_ids=["second"], block_tables=[tables[1]], start_pos=[0], input_lens=[5])
+            logits = model(torch.tensor([[9], [10]], device=device), pos_ids=torch.tensor([[3], [5]], device=device), kv_cache_manager=cache, request_ids=["first", "second"], block_tables=tables, start_pos=[3, 5], input_lens=[1, 1])
+        return logits
+    torch.testing.assert_close(decode(True), decode(False), rtol=1e-5, atol=1e-5)
+
+@pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
+def test_fused_projections_match_unfused_model(device):
+    import copy
+    torch.manual_seed(42)
+    model = Model(vocab_size=32, hidden_size=8, intermediate_size=16, n_hidden_layers=2, head_dim=2, rope_theta=10000, n_query_heads=4, n_kv_heads=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6).to(device).eval()
+    fused = copy.deepcopy(model)
+    fused.fuse_projections()
+    input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]], device=device)
+    with torch.inference_mode():
+        expected = model(input_ids)
+        actual = fused(input_ids)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    for layer in fused.layers:
+        assert layer.self_attn.q_proj is None
+        assert layer.mlp.gate_proj is None
+        assert layer.self_attn.qkv_proj.weight.device.type == device

@@ -1,6 +1,19 @@
 import torch
+import pytest
 from transformers import AutoModelForCausalLM
 from utils.layers import RMSNorm
+
+@pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_native_rmsnorm_matches_manual_path(device, dtype):
+    torch.manual_seed(42)
+    norm = RMSNorm(128, 1e-6).to(device=device, dtype=dtype).eval()
+    hidden_states = torch.randn(2, 5, 128, device=device, dtype=dtype)
+    with torch.inference_mode():
+        native = norm(hidden_states)
+        norm.use_native = False
+        manual = norm(hidden_states)
+    torch.testing.assert_close(native, manual, rtol=1e-3 if dtype == torch.float16 else 1e-5, atol=2e-3 if dtype == torch.float16 else 1e-5)
 
 def test_rmsnorm():
     model_name="Qwen/Qwen3-1.7B"

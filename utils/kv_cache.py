@@ -95,6 +95,13 @@ class PagedKVCache:
         self.block_hashes = {}
         self.hash_to_block_id = {}
         self.idle_lru = OrderedDict()
+        self._batch_block_ids_key = None
+        self._batch_block_ids = None
+        self._ragged_block_ids_key = None
+        self._ragged_block_ids = None
+        self._ragged_mask_key = None
+        self._ragged_mask = None
+        self.contiguous_read_fast_path = True
 
     def add_cacheable_block(self, block_id):
         if block_id not in self.allocated_blocks:
@@ -226,12 +233,17 @@ class PagedKVCache:
         num_new_tokens = new_keys.shape[1]
         if num_new_tokens <= 0:
             raise ValueError(f"Cannot append zero tokens: {num_new_tokens}")
-        for new_token_index in range(num_new_tokens):
+        new_token_index = 0
+        while new_token_index < num_new_tokens:
             token_pos = start_pos + new_token_index
             physical_block, block_offset = self.ensure_token_block(block_table, token_pos)
-            self.key_cache[layer_index, physical_block, block_offset, :, :] = new_keys[:, new_token_index, :]
-            self.value_cache[layer_index, physical_block, block_offset, :, :] = new_values[:, new_token_index, :]
-        
+            tokens_in_block = min(self.block_size - block_offset, num_new_tokens - new_token_index)
+            source_slice = slice(new_token_index, new_token_index + tokens_in_block)
+            target_slice = slice(block_offset, block_offset + tokens_in_block)
+            self.key_cache[layer_index, physical_block, target_slice].copy_(new_keys[:, source_slice].permute(1, 0, 2))
+            self.value_cache[layer_index, physical_block, target_slice].copy_(new_values[:, source_slice].permute(1, 0, 2))
+            new_token_index += tokens_in_block
+
     def get(self, layer_index, block_table, end_pos):
         if layer_index < 0 or layer_index >= self.num_layers:
             raise IndexError(f"Invalid layer index: {layer_index}, num_layers: {self.num_layers}")
@@ -240,6 +252,13 @@ class PagedKVCache:
         num_reqd_blocks = math.ceil(end_pos / self.block_size)
         if num_reqd_blocks > len(block_table):
             raise IndexError(f"Number of blocks required {num_reqd_blocks} is more than the block table has")
+        physical_blocks = block_table[:num_reqd_blocks]
+        if self.contiguous_read_fast_path and all(block_id in self.allocated_blocks and block_id == physical_blocks[0] + index for index, block_id in enumerate(physical_blocks)):
+            first_block = physical_blocks[0]
+            last_block = first_block + num_reqd_blocks
+            keys = self.key_cache[layer_index, first_block:last_block].reshape(-1, self.num_kv_heads, self.head_dim)[:end_pos].permute(1, 0, 2)
+            values = self.value_cache[layer_index, first_block:last_block].reshape(-1, self.num_kv_heads, self.head_dim)[:end_pos].permute(1, 0, 2)
+            return keys, values
         keys = []
         values = []
         for i in range(num_reqd_blocks):
@@ -252,6 +271,62 @@ class PagedKVCache:
             keys.append(key_piece)
             values.append(value_piece)
         return torch.cat(keys, dim=1), torch.cat(values, dim=1)
+
+    def get_batch(self, layer_index, block_tables, end_pos):
+        if layer_index < 0 or layer_index >= self.num_layers:
+            raise IndexError(f"Invalid layer index: {layer_index}, num_layers: {self.num_layers}")
+        if end_pos <= 0:
+            raise ValueError(f"end_pos must be positive: {end_pos}")
+        if not block_tables:
+            raise ValueError("At least one block table is required")
+        num_required_blocks = math.ceil(end_pos / self.block_size)
+        for block_table in block_tables:
+            if len(block_table) < num_required_blocks:
+                raise IndexError(f"Number of blocks required {num_required_blocks} is more than the block table has")
+            for block_id in block_table[:num_required_blocks]:
+                if block_id not in self.allocated_blocks:
+                    raise KVCacheStateError(f"Block {block_id} is not an allocated block")
+        block_ids_key = tuple(tuple(table[:num_required_blocks]) for table in block_tables)
+        if block_ids_key != self._batch_block_ids_key:
+            self._batch_block_ids = torch.tensor(block_ids_key, device=self.device, dtype=torch.long).flatten()
+            self._batch_block_ids_key = block_ids_key
+        shape = (len(block_tables), num_required_blocks * self.block_size, self.num_kv_heads, self.head_dim)
+        keys = self.key_cache[layer_index].index_select(0, self._batch_block_ids).reshape(shape)[:, :end_pos].permute(0, 2, 1, 3).contiguous()
+        values = self.value_cache[layer_index].index_select(0, self._batch_block_ids).reshape(shape)[:, :end_pos].permute(0, 2, 1, 3).contiguous()
+        return keys, values
+
+    def get_batch_ragged(self, layer_index, block_tables, end_positions):
+        if layer_index < 0 or layer_index >= self.num_layers:
+            raise IndexError(f"Invalid layer index: {layer_index}, num_layers: {self.num_layers}")
+        if not block_tables or len(block_tables) != len(end_positions):
+            raise ValueError(f"Block tables and end positions must have the same nonzero length: tables: {len(block_tables)}, positions: {len(end_positions)}")
+        if any(end_pos <= 0 for end_pos in end_positions):
+            raise ValueError(f"End positions must be positive: {end_positions}")
+        max_end_pos = max(end_positions)
+        max_blocks = math.ceil(max_end_pos / self.block_size)
+        pad_block_id = block_tables[0][0] if block_tables[0] else None
+        padded_tables = []
+        for block_table, end_pos in zip(block_tables, end_positions):
+            required_blocks = math.ceil(end_pos / self.block_size)
+            if len(block_table) < required_blocks:
+                raise IndexError(f"Number of blocks required {required_blocks} is more than the block table has")
+            used_blocks = block_table[:required_blocks]
+            for block_id in used_blocks:
+                if block_id not in self.allocated_blocks:
+                    raise KVCacheStateError(f"Block {block_id} is not an allocated block")
+            padded_tables.append(tuple(used_blocks + [pad_block_id] * (max_blocks - required_blocks)))
+        block_ids_key = tuple(padded_tables)
+        if block_ids_key != self._ragged_block_ids_key:
+            self._ragged_block_ids = torch.tensor(block_ids_key, device=self.device, dtype=torch.long).flatten()
+            self._ragged_block_ids_key = block_ids_key
+        mask_key = tuple(end_positions)
+        if mask_key != self._ragged_mask_key:
+            self._ragged_mask = (torch.arange(max_end_pos, device=self.device).unsqueeze(0) < torch.tensor(end_positions, device=self.device).unsqueeze(1))[:, None, None, None, :]
+            self._ragged_mask_key = mask_key
+        shape = (len(block_tables), max_blocks * self.block_size, self.num_kv_heads, self.head_dim)
+        keys = self.key_cache[layer_index].index_select(0, self._ragged_block_ids).reshape(shape)[:, :max_end_pos].permute(0, 2, 1, 3).contiguous()
+        values = self.value_cache[layer_index].index_select(0, self._ragged_block_ids).reshape(shape)[:, :max_end_pos].permute(0, 2, 1, 3).contiguous()
+        return keys, values, self._ragged_mask
             
 
 class KVCacheManager:

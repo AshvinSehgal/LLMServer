@@ -36,15 +36,19 @@ def test_mps_profile_context_uses_signposts_without_forcing_each_dispatch_to_fin
 
 def test_profile_model_operations_labels_hot_paths_and_restores_methods():
     norm = RMSNorm(4, 1e-6)
-    cache = SimpleNamespace(append=Mock(), get=Mock())
+    cache = SimpleNamespace(append=Mock(), get=Mock(), get_batch=Mock(), get_batch_ragged=Mock())
     engine = SimpleNamespace(model=torch.nn.Sequential(norm), kv_cache=cache)
     with profile(activities=[ProfilerActivity.CPU], acc_events=True) as profiler:
         with profile_model_operations(engine):
             norm(torch.ones(1, 4))
             cache.append()
             cache.get()
+            cache.get_batch()
+            cache.get_batch_ragged()
     names = {event.key for event in profiler.key_averages()}
-    assert {"RMSNorm.forward", "PagedKVCache.append", "PagedKVCache.get"} <= names
+    assert {"RMSNorm.forward", "PagedKVCache.append", "PagedKVCache.get", "PagedKVCache.get_batch", "PagedKVCache.get_batch_ragged"} <= names
     assert "forward" not in norm.__dict__
     cache.append.assert_called_once()
     cache.get.assert_called_once()
+    cache.get_batch.assert_called_once()
+    cache.get_batch_ragged.assert_called_once()

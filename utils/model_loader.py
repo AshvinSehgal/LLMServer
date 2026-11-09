@@ -10,7 +10,9 @@ def resolve_decode_attention(device, decode_attention):
         raise ValueError(f"Unknown decode attention path: {decode_attention}")
     return decode_attention
 
-def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa=False, decode_attention=None):
+def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa=True, decode_attention=None, fuse_projections=True, quantize=None):
+    if quantize not in (None, "int8", "int4"):
+        raise ValueError(f"Unknown quantization mode: {quantize}")
     if device is None:
         if torch.backends.mps.is_available():
             device = torch.device("mps")
@@ -59,4 +61,11 @@ def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa
     del model
     gc.collect()
     my_model.to(device=device, dtype=dtype)
+    if fuse_projections:
+        my_model.fuse_projections()
+    if quantize is not None:
+        my_model.quantize(quantize)
+        gc.collect()
+        if torch.device(device).type == "mps":
+            torch.mps.empty_cache()
     return my_model

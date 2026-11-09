@@ -139,6 +139,20 @@ def test_gather_sdpa_decode_matches_full_attention():
     assert block_table == [0, 1, 2]
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
+@pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
+def test_single_decode_grouped_kv_matches_repeated_kv(device):
+    torch.manual_seed(42)
+    attention = SelfAttention(hidden_size=8, n_query_heads=4, n_kv_heads=2, head_dim=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention="gather_sdpa").to(device).eval()
+    cache = PagedKVCache(num_layers=1, num_blocks=3, block_size=2, num_kv_heads=2, head_dim=2, device=torch.device(device), dtype=torch.float32)
+    block_table = []
+    cache.append(0, block_table, 0, torch.randn(2, 5, 2, device=device), torch.randn(2, 5, 2, device=device))
+    query = torch.randn(1, 4, 1, 2, device=device)
+    with torch.inference_mode():
+        grouped = attention.gather_sdpa_read(query, cache, 0, block_table, 5, 2)
+        attention.grouped_single_decode = False
+        repeated = attention.gather_sdpa_read(query, cache, 0, block_table, 5, 2)
+    torch.testing.assert_close(grouped, repeated, rtol=1e-4, atol=1e-4)
+
 def test_self_attention_rejects_unknown_decode_path():
     with pytest.raises(ValueError, match="Unknown decode attention path"):
         SelfAttention(hidden_size=8, n_query_heads=4, n_kv_heads=2, head_dim=2, bias=False, attention_scaling=2 ** -0.5, rms_norm_eps=1e-6, decode_attention="unknown")

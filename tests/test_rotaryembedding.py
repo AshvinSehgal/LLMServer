@@ -35,3 +35,13 @@ def test_rotary_embedding():
         actual_query, actual_key = apply_rotary_embedding(query, key, actual_cosine, actual_sine)
     torch.testing.assert_close(actual_query, expected_query, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(actual_key, expected_key, rtol=1e-5, atol=1e-5)
+
+def test_rotary_embedding_reuses_inverse_frequencies():
+    rope = RotaryEmbedding(head_dim=8, rope_theta=10000)
+    hidden_states = torch.zeros(1, 3, 8)
+    first_cosine, first_sine = rope(hidden_states, torch.tensor([[0, 1, 2]]))
+    cached_frequencies = rope._inverse_frequencies
+    second_cosine, second_sine = rope(hidden_states, torch.tensor([[0, 1, 2]]))
+    assert rope._inverse_frequencies is cached_frequencies
+    torch.testing.assert_close(first_cosine, second_cosine)
+    torch.testing.assert_close(first_sine, second_sine)

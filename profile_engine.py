@@ -52,6 +52,8 @@ def profile_model_operations(engine):
                 stack.enter_context(patch.object(module, "gather_sdpa_read", profile_wrapper("SelfAttention.gather_sdpa_read", module.gather_sdpa_read)))
         stack.enter_context(patch.object(engine.kv_cache, "append", profile_wrapper("PagedKVCache.append", engine.kv_cache.append)))
         stack.enter_context(patch.object(engine.kv_cache, "get", profile_wrapper("PagedKVCache.get", engine.kv_cache.get)))
+        stack.enter_context(patch.object(engine.kv_cache, "get_batch", profile_wrapper("PagedKVCache.get_batch", engine.kv_cache.get_batch)))
+        stack.enter_context(patch.object(engine.kv_cache, "get_batch_ragged", profile_wrapper("PagedKVCache.get_batch_ragged", engine.kv_cache.get_batch_ragged)))
         yield
 
 
@@ -105,7 +107,7 @@ def main():
     print(profiler.key_averages().table(sort_by=sort_by, row_limit=25))
     print("Engine operation breakdown (CPU total time includes nested operations):")
     for event in profiler.key_averages():
-        if event.key in ("RMSNorm.forward", "SelfAttention.direct_paged_read", "SelfAttention.gather_sdpa_read", "PagedKVCache.append", "PagedKVCache.get"):
+        if event.key in ("RMSNorm.forward", "SelfAttention.direct_paged_read", "SelfAttention.gather_sdpa_read", "PagedKVCache.append", "PagedKVCache.get", "PagedKVCache.get_batch", "PagedKVCache.get_batch_ragged"):
             print(f"{event.key}: {event.cpu_time_total / 1000:.2f} ms across {event.count} calls")
     if device.type == "cuda":
         print(f"Peak CUDA memory: {torch.cuda.max_memory_allocated(device) / 2 ** 20:.1f} MiB")

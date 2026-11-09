@@ -23,6 +23,19 @@ def test_model_loader_assigns_weights_without_a_second_cpu_copy():
         actual = custom(input_ids)
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
+def test_model_loader_fuses_projections_after_loading_weights():
+    config = Qwen3Config(vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=4, rope_theta=10000, rms_norm_eps=1e-6)
+    reference = AutoModelForCausalLM.from_config(config).eval()
+    with patch("utils.model_loader.AutoModelForCausalLM.from_pretrained", return_value=reference):
+        custom = model_loader("tiny-qwen", device=torch.device("cpu"), fuse_projections=True)
+    assert all(layer.self_attn.qkv_proj is not None and layer.mlp.gate_up_proj is not None for layer in custom.layers)
+    assert all(parameter.device.type != "meta" for parameter in custom.parameters())
+    input_ids = torch.tensor([[1, 2, 3]])
+    with torch.inference_mode():
+        expected = reference(input_ids=input_ids, use_cache=False).logits
+        actual = custom(input_ids)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
 def get_hook(outputs, name):
     def hook(module, inputs, output):
         if isinstance(output, tuple):

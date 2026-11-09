@@ -36,6 +36,30 @@ class PrefillBatch:
         self.attention_mask = torch.zeros(combined_blocked.shape, device=device, dtype=dtype).masked_fill_(combined_blocked, torch.finfo(dtype).min)
         self.batch_size = len(requests)
 
+class PackedPrefillBatch:
+    def __init__(self, requests, device, dtype, chunk_lengths):
+        if not requests or len(requests) != len(chunk_lengths):
+            raise ValueError("Packed prefill requires one positive chunk length per request")
+        if any(request.num_computed_tokens != 0 or length <= 0 or length > len(request.prefill_token_ids) for request, length in zip(requests, chunk_lengths)):
+            raise ValueError("Packed prefill only supports initial positive prompt chunks")
+        self.packed = True
+        self.batch_size = len(requests)
+        self.requests = requests
+        self.request_ids = [request.request_id for request in requests]
+        self.block_tables = [request.block_table for request in requests]
+        self.start_pos = [0] * self.batch_size
+        self.input_lens = list(chunk_lengths)
+        offsets = [0]
+        for length in chunk_lengths:
+            offsets.append(offsets[-1] + length)
+        self.last_token_indices = torch.tensor([offsets[index + 1] - 1 for index in range(self.batch_size)], device=device, dtype=torch.long)
+        self.input_ids = torch.tensor([token_id for request, length in zip(requests, chunk_lengths) for token_id in request.prefill_token_ids[:length]], device=device, dtype=torch.long).unsqueeze(0)
+        self.pos_ids = torch.tensor([position for length in chunk_lengths for position in range(length)], device=device, dtype=torch.long).unsqueeze(0)
+        segment_ids = torch.tensor([index for index, length in enumerate(chunk_lengths) for _ in range(length)], device=device, dtype=torch.long)
+        positions = torch.arange(offsets[-1], device=device)
+        blocked = (segment_ids[:, None] != segment_ids[None, :]) | (positions[None, :] > positions[:, None])
+        self.attention_mask = torch.zeros((1, 1, offsets[-1], offsets[-1]), device=device, dtype=dtype).masked_fill_(blocked[None, None], torch.finfo(dtype).min)
+
 class DecodeBatch:
     def __init__(self, requests, device, dtype):
         if not requests:
@@ -49,11 +73,9 @@ class DecodeBatch:
         self.block_tables = [request.block_table for request in self.requests]
         self.start_pos = [request.num_computed_tokens for request in self.requests]
         self.input_lens = [1 for request in self.requests]
-        self.last_token_indices = torch.zeros(self.batch_size, device=device, dtype=torch.long)
-        self.input_ids = torch.tensor([request.generated_token_ids[-1] for request in self.requests], device=device, dtype=torch.long).unsqueeze(1)
-        key_lengths = [request.num_computed_tokens + 1 for request in self.requests]
-        max_key_length = max(key_lengths)
-        self.padding_mask = torch.tensor([([1] * key_len + [0] * (max_key_length - key_len)) for key_len in key_lengths], device=device, dtype=torch.bool)
-        padding_keys_blocked = (~self.padding_mask).unsqueeze(1).unsqueeze(2)
-        self.attention_mask = torch.zeros(padding_keys_blocked.shape, device=device, dtype=dtype).masked_fill_(padding_keys_blocked, torch.finfo(dtype).min)
-        self.pos_ids = torch.tensor([request.num_computed_tokens for request in self.requests], device=device, dtype=torch.long).unsqueeze(1)
+        # One host-to-device copy for all three small tensors instead of three.
+        uploaded = torch.tensor([[request.generated_token_ids[-1] for request in self.requests], [request.num_computed_tokens for request in self.requests], [0] * self.batch_size], device=device, dtype=torch.long)
+        self.input_ids = uploaded[0].unsqueeze(1)
+        self.last_token_indices = uploaded[2]
+        self.pos_ids = uploaded[1].unsqueeze(1)
+        self.attention_mask = None

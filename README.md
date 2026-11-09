@@ -14,6 +14,7 @@ The project currently targets the Qwen3 architecture and uses Hugging Face only 
 - Incremental text streaming through `asyncio.Queue`
 - Waiting and running request queues
 - Padded prefill batches and single-token decode batches
+- Packed initial prefill for imbalanced requests up to 512 tokens, with length bucketing as the fallback
 - Continuous batching with batch-size and token-budget limits, chunked prefill and cache-aware admission
 - Recompute preemption when running requests need more KV-cache blocks
 - Request cancellation and lifecycle tracking
@@ -21,6 +22,12 @@ The project currently targets the Qwen3 architecture and uses Hugging Face only 
 - Paged KV cache with per-request block tables, shared physical blocks and reference counts
 - Complete-block prefix caching with chained hashes, longest-prefix lookup and LRU eviction of idle blocks
 - Direct paged-cache reads during decode, integrated across the engine, model layers and grouped-query attention
+- Batched cached decode for equal-length and mixed-length requests on the gather-plus-SDPA path
+- Shared-KV-head single-request decode and a no-concatenation read for consecutive KV blocks
+- Fused Q/K/V and gate/up projections (default; `fuse_projections=False` to disable)
+- Joint Q/K RMSNorm and rotary embedding in one pass, SDPA prefill by default, and a mask-free causal SDPA path with grouped KV heads for each request's first prefill chunk
+- Optional weight-only int8 quantization (`model_loader(..., quantize="int8")`, `benchmark.py --quantize int8`): per-output-channel scales and PyTorch's `_weight_int8pack_mm`, which halves weight memory and roughly 1.8x's batch-1 decode on MPS; it is lossy, so outputs can diverge from the fp16 reference
+- Experimental int4 mode (`quantize="int4"`, MPS only): group-wise int4 decoder weights for 1-2 row decode steps, with an int8 copy for larger batches and prefill because MPS's int4 kernel is slow beyond a few rows; `lm_head` stays int8. About 25% faster than int8 at batch 1 but uses more memory than int8 and is noticeably lossy (perplexity about +22% on the test text), so it is off by default
 
 Prefill writes each request's keys and values into blocks referenced by its block table. Later decode steps process only the newest token and read the previously cached history directly from those blocks. Finished and cancelled requests release their block references; complete, unreferenced prompt blocks remain cached until memory pressure evicts them.
 
@@ -76,6 +83,20 @@ python benchmark.py --prompt "Explain what a KV cache does in one sentence." --m
 The script reports model-loading time separately from generation time, along with time to first token and tokens per second. It runs on CPU when neither MPS nor CUDA is available; the CPU result will be much slower than a GPU result.
 Use `--repeats 3` to report median generation, time-to-first-token and decode throughput without reloading each model. Each custom measurement uses a fresh engine so prefix-cache hits cannot affect the comparison. The benchmark also reports whether generated greedy token IDs match Hugging Face.
 
+On MPS, use `--custom-dtype fp16` to benchmark both models in half precision. The benchmark prints each model's actual weight dtype and matches the Hugging Face dtype to the custom dtype by default. Use `--reference-dtype fp32` only when you intentionally want a cross-dtype comparison. The matrix command also reports allocated MPS model memory after loading:
+
+```bash
+python benchmark.py --matrix --custom-dtype fp16 --matrix-prompt-tokens 16,128 --matrix-output-tokens 32 --matrix-batch-sizes 1,2 --repeats 3
+```
+
+`--custom-dtype fp32` provides a matching full-precision baseline; the default `source` uses the dtype produced by the installed Transformers loader, which may be FP32 even if the checkpoint declares BF16. FP16 can change generated tokens, so compare output quality on your own prompts before using it as a default. For application code, pass `dtype=torch.float16` to `model_loader()` to select the same mode.
+
+Use `--fuse-projections` to benchmark one combined Q/K/V projection and one combined gate/up projection per layer. Fusion is opt-in because its gain on MPS was small in the measured batch-2 case. The engine now packs initial mixed-length prefill chunks into one block-diagonal attention call when padding would otherwise add at least 50% extra token positions and the packed total is at most 512 tokens. Larger or resumed chunks use length bucketing. Pass `packed_prefill=False` or `prefill_bucketing=False` to disable either path. Compare padded, bucketed and packed modes with `python benchmark.py --mixed-prefill-tokens 16,128 --max-new-tokens 32 --repeats 3`.
+
+RMSNorm uses PyTorch's native operation by default to reduce MPS dispatch overhead. Set `use_native=False` on an `RMSNorm` module to compare with the original explicit FP32-normalization implementation.
+
+Qwen's ByteLevel tokenizer now streams decoded text incrementally, including UTF-8 characters that span tokens. Other tokenizer types retain the full-prefix decode fallback for correctness.
+
 To inspect scheduling, prefill, decode and PyTorch operator costs, run:
 
 ```bash
@@ -91,6 +112,7 @@ The engine loop does not call `.item()`, `.cpu()` or print GPU tensors per token
 
 Scaled dot-product attention is available as an opt-in path for full attention and cached prefill: add `--sdpa` to `benchmark.py` to compare it with the default eager path. Direct paged decode remains on its separate path. The eager path remains the default because low-precision SDPA can differ from the Hugging Face eager reference; benchmark and validate token IDs on your target GPU before enabling it by default.
 For decode attention, `--decode-attention gather_sdpa` selects a gather-plus-SDPA alternative. Use `--compare-decode-attention --repeats 3` to compare it with direct paged reads on one loaded custom model.
+For a single request, this path shares each KV head across its query-head group instead of repeating cached K/V tensors. When the request's physical KV blocks are consecutive, the cache also returns a view instead of concatenating those blocks; fragmented or shared layouts keep the original fallback.
 The gather-plus-SDPA decode path is now the default when `model_loader()` targets MPS. It matched Hugging Face greedy token IDs and reached 11.27 median decode tokens/s versus 9.93 for direct paged reads in a three-run test on one prompt. CPU and CUDA retain direct paged reads by default; `--decode-attention direct` overrides the MPS choice.
 
 ## Development status

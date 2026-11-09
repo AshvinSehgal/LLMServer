@@ -4,7 +4,7 @@ from datetime import timedelta
 import torch
 import torch.nn as nn
 import pytest
-from utils.engine import Engine
+from utils.engine import Engine, ByteLevelStreamDecoder
 from utils.kv_cache import PagedKVCache, KVCacheExhaustedError
 from utils.request import RequestFinishReason, RequestStatus
 
@@ -37,16 +37,86 @@ class Model(nn.Module):
 
     def forward(self, input_ids, pos_ids, attention_mask, **kwargs):
         self.inference_mode_by_call.append(torch.is_inference_mode_enabled())
-        self.calls.append({"input_shape": tuple(input_ids.shape), "input_ids": input_ids.tolist(), "pos_ids": pos_ids.tolist(), "request_ids": kwargs["request_ids"], "block_tables": kwargs["block_tables"], "start_pos": kwargs["start_pos"], "input_lens": kwargs["input_lens"], "kv_cache_manager": kwargs["kv_cache_manager"]})
+        self.calls.append({"input_shape": tuple(input_ids.shape), "input_ids": input_ids.tolist(), "pos_ids": pos_ids.tolist(), "request_ids": kwargs["request_ids"], "block_tables": kwargs["block_tables"], "start_pos": kwargs["start_pos"], "input_lens": kwargs["input_lens"], "kv_cache_manager": kwargs["kv_cache_manager"], "packed": kwargs.get("packed", False)})
         for block_table, start_pos, input_len in zip(kwargs["block_tables"], kwargs["start_pos"], kwargs["input_lens"]):
             for token_pos in range(start_pos, start_pos + input_len):
                 kwargs["kv_cache_manager"].ensure_token_block(block_table, token_pos)
         token_ids = self.token_ids_by_call.pop(0)
-        assert len(token_ids) == input_ids.shape[0]
-        logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 100, device=input_ids.device)
-        for row, token_id in enumerate(token_ids):
-            logits[row, :, token_id] = 1
+        assert len(token_ids) == (len(kwargs["request_ids"]) if kwargs.get("packed") else input_ids.shape[0])
+        logit_rows = kwargs.get("logit_rows")
+        if logit_rows is None:
+            logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 100, device=input_ids.device)
+            for row, token_id in enumerate(token_ids):
+                logits[row, :, token_id] = 1
+        else:
+            logits = torch.zeros(len(logit_rows), 100, device=input_ids.device)
+            for output_row, batch_row in enumerate(logit_rows):
+                logits[output_row, token_ids[batch_row]] = 1
         return logits
+
+def test_byte_level_stream_decoder_matches_qwen_tokenizer():
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B", local_files_only=True)
+    token_ids = tokenizer("Hello 👋, café. 你好!\n", add_special_tokens=False)["input_ids"] + [tokenizer.eos_token_id]
+    decoder = ByteLevelStreamDecoder(tokenizer)
+    streamed = "".join(decoder.push(token_id) for token_id in token_ids) + decoder.finish()
+    assert streamed == tokenizer.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+def test_engine_byte_level_streaming_matches_qwen_tokenizer():
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B", local_files_only=True)
+    token_ids = tokenizer("Hello 👋, café. 你好!\n", add_special_tokens=False)["input_ids"] + [tokenizer.eos_token_id]
+    model = Model(token_ids_by_call=[], bos_token_id=1, pad_token_id=1, eos_token_id=tokenizer.eos_token_id)
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=len(token_ids), max_batch_size=1, max_num_batched_tokens=32)
+    request = engine.add_request("Hello")
+    request.start_prefill()
+    request.advance_prefill(len(request.prompt_token_ids))
+    request.complete_prefill()
+    for token_id in token_ids:
+        engine.accept_generated_token(request, token_id)
+    chunks = []
+    while (chunk := request.output_queue.get_nowait()) is not None:
+        chunks.append(chunk)
+    expected = tokenizer.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    assert "".join(chunks) == expected
+    assert request.emitted_text == expected
+    assert request.status == RequestStatus.FINISHED
+
+def test_engine_prefill_bucketing_avoids_heavy_padding():
+    tokenizer = Tokenizer(bos_token_id=1, prompt_token_ids={"long": list(range(10, 19)), "short": [10]})
+    model = Model(token_ids_by_call=[[50], [60]])
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=1, max_batch_size=2, max_num_batched_tokens=20, kv_cache_num_blocks=4, kv_cache_block_size=16, stream_text=False, packed_prefill=False)
+    assert engine.prefill_bucketing
+    long_request = engine.add_request("long")
+    short_request = engine.add_request("short")
+    assert not engine.step()
+    assert [call["input_shape"] for call in model.calls] == [(1, 1), (1, 9)]
+    assert long_request.generated_token_ids == [60]
+    assert short_request.generated_token_ids == [50]
+
+def test_engine_packs_initial_imbalanced_prefill_by_default():
+    tokenizer = Tokenizer(bos_token_id=1, prompt_token_ids={"long": list(range(10, 19)), "short": [10]})
+    model = Model(token_ids_by_call=[[50, 60]])
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=1, max_batch_size=2, max_num_batched_tokens=20, kv_cache_num_blocks=4, kv_cache_block_size=16, stream_text=False)
+    long_request = engine.add_request("long")
+    short_request = engine.add_request("short")
+    assert not engine.step()
+    assert model.calls[0]["packed"]
+    assert model.calls[0]["input_shape"] == (1, 10)
+    assert long_request.generated_token_ids == [50]
+    assert short_request.generated_token_ids == [60]
+
+def test_engine_large_imbalanced_prefill_uses_bucketing_instead_of_packing():
+    tokenizer = Tokenizer(bos_token_id=1, prompt_token_ids={"long": list(range(10, 610)), "short": [10]})
+    model = Model(token_ids_by_call=[[50], [60]])
+    engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=1, max_batch_size=2, max_num_batched_tokens=700, kv_cache_num_blocks=50, kv_cache_block_size=16, stream_text=False)
+    long_request = engine.add_request("long")
+    short_request = engine.add_request("short")
+    assert not engine.step()
+    assert [call["packed"] for call in model.calls] == [False, False]
+    assert [call["input_shape"] for call in model.calls] == [(1, 1), (1, 600)]
+    assert long_request.generated_token_ids == [60]
+    assert short_request.generated_token_ids == [50]
 
 def test_engine_add_request():
     model = Model(token_ids_by_call=[])
@@ -102,6 +172,16 @@ def test_engine_prefill_batch_and_inference_mode():
     assert first_request.block_table == [0]
     assert second_request.block_table == [1]
     assert engine.kv_cache.num_allocated_blocks == 2
+
+def test_engine_can_skip_text_decoding_for_model_benchmarks():
+    model = Model(token_ids_by_call=[[50], [51]])
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=2, max_batch_size=1, max_num_batched_tokens=20, stream_text=False)
+    request = engine.add_request("Hello")
+    while engine.step():
+        pass
+    assert request.generated_token_ids == [50, 51]
+    assert request.emitted_text == ""
+    assert request.output_queue.get_nowait() is None
 
 @pytest.mark.parametrize(("prompt_length", "expected_complete_blocks"), [(3, 0), (4, 1), (6, 1), (8, 2)])
 def test_engine_marks_only_complete_prompt_blocks_cacheable(prompt_length, expected_complete_blocks):
