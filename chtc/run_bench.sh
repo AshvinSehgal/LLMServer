@@ -149,6 +149,11 @@ note "running benchmark: backends=$BACKENDS $* ${EXTRA[*]-}"
 python benchmark_cuda.py --run-all --model "$MODEL" --backends "$BACKENDS" --out-dir "$RESULTS/bench" ${EXTRA[@]+"${EXTRA[@]}"} "$@" > "$RESULTS/benchmark_stdout.txt" 2>&1
 note "benchmark exit code: $?"
 
+if [ "${ALLOW_NO_CUDA:-0}" != "1" ]; then
+  python agreement_check.py --model "$MODEL" > "$RESULTS/agreement_check.txt" 2>&1 || note "WARNING: agreement_check.py failed; see agreement_check.txt"
+  note "agreement check:"; head -8 "$RESULTS/agreement_check.txt" | tee -a "$STATUS"
+fi
+
 if [ -f "$RESULTS/bench/report.md" ]; then
   { echo; cat "$RESULTS/bench/report.md"; echo; } | tee -a "$STATUS"
 else

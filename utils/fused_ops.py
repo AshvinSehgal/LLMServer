@@ -26,6 +26,25 @@ def add_rms_norm_reference(hidden, delta, weight, eps):
     return total, F.rms_norm(total, (weight.shape[0],), weight, eps)
 
 
+def qkv_norm_rotary_write_reference(qkv, norm_weight, cosine, signed_sine, slot_mapping, key_cache, value_cache, n_query_heads, n_kv_heads, head_dim, eps):
+    """Unfused twin of `qkv_norm_rotary_write`: returns Q [rows, n_query_heads, head_dim] and writes K, V into the cache slots.
+
+    qkv: [rows, 1, (n_query_heads + 2 * n_kv_heads) * head_dim]; norm_weight: [n_query_heads + n_kv_heads, head_dim] or None;
+    cosine/signed_sine: [rows, 1, head_dim]; key_cache/value_cache: one layer, [blocks, block_size, n_kv_heads, head_dim].
+    """
+    rows = qkv.shape[0]
+    n_qk = n_query_heads + n_kv_heads
+    qk = qkv[..., :n_qk * head_dim].reshape(rows, 1, n_qk, head_dim)
+    values = qkv[..., n_qk * head_dim:].reshape(rows, n_kv_heads, head_dim)
+    if norm_weight is not None:
+        qk = F.rms_norm(qk, (head_dim,), None, eps) * norm_weight
+    half = head_dim // 2
+    qk = torch.addcmul(qk * cosine.unsqueeze(2), torch.cat([qk[..., half:], qk[..., :half]], dim=-1), signed_sine.unsqueeze(2))
+    key_cache.view(-1, n_kv_heads, head_dim).index_copy_(0, slot_mapping, qk[:, 0, n_query_heads:])
+    value_cache.view(-1, n_kv_heads, head_dim).index_copy_(0, slot_mapping, values)
+    return qk[:, 0, :n_query_heads]
+
+
 def silu_mul_reference(gate_up):
     gate, up = gate_up.chunk(2, dim=-1)
     return F.silu(gate) * up
@@ -56,6 +75,49 @@ if TRITON_AVAILABLE:
         up = tl.load(gate_up_ptr + row * 2 * N + N + cols, mask=mask, other=0.0).to(tl.float32)
         silu = (gate * tl.sigmoid(gate)).to(out_ptr.dtype.element_ty).to(tl.float32)  # SiLU rounds to the activation dtype before the multiply
         tl.store(out_ptr + row * N + cols, (silu * up).to(out_ptr.dtype.element_ty), mask=mask)
+
+    @triton.jit
+    def _qkv_norm_rotary_write_kernel(qkv_ptr, weight_ptr, cos_ptr, sin_ptr, slot_ptr, q_ptr, key_cache_ptr, value_cache_ptr, eps,
+                                      N_Q: tl.constexpr, N_KV: tl.constexpr, HEAD_DIM: tl.constexpr, HAS_NORM: tl.constexpr):
+        """One program per (row, head): normalize + rotate Q/K heads (rounding where the unfused ops round), copy V, and store
+        Q to its output and K/V straight into the cache slot."""
+        row = tl.program_id(0)
+        head = tl.program_id(1)
+        HALF: tl.constexpr = HEAD_DIM // 2
+        offs = tl.arange(0, HALF)
+        src = qkv_ptr + row * (N_Q + 2 * N_KV) * HEAD_DIM + head * HEAD_DIM
+        dtype = qkv_ptr.dtype.element_ty
+        x1 = tl.load(src + offs)
+        x2 = tl.load(src + HALF + offs)
+        if head < N_Q + N_KV:
+            if HAS_NORM:
+                f1 = x1.to(tl.float32)
+                f2 = x2.to(tl.float32)
+                rstd = tl.rsqrt((tl.sum(f1 * f1, axis=0) + tl.sum(f2 * f2, axis=0)) / HEAD_DIM + eps)
+                w1 = tl.load(weight_ptr + head * HEAD_DIM + offs).to(tl.float32)
+                w2 = tl.load(weight_ptr + head * HEAD_DIM + HALF + offs).to(tl.float32)
+                x1 = (((f1 * rstd).to(dtype)).to(tl.float32) * w1).to(dtype)  # rms_norm rounds to dtype, then the weight multiply rounds again
+                x2 = (((f2 * rstd).to(dtype)).to(tl.float32) * w2).to(dtype)
+            c1 = tl.load(cos_ptr + row * HEAD_DIM + offs).to(tl.float32)
+            c2 = tl.load(cos_ptr + row * HEAD_DIM + HALF + offs).to(tl.float32)
+            s1 = tl.load(sin_ptr + row * HEAD_DIM + offs).to(tl.float32)
+            s2 = tl.load(sin_ptr + row * HEAD_DIM + HALF + offs).to(tl.float32)
+            a1 = (x1.to(tl.float32) * c1).to(dtype).to(tl.float32)  # x * cos rounds, then addcmul adds the swapped * signed_sin in one fused step
+            a2 = (x2.to(tl.float32) * c2).to(dtype).to(tl.float32)
+            r1 = (a1 + x2.to(tl.float32) * s1).to(dtype)
+            r2 = (a2 + x1.to(tl.float32) * s2).to(dtype)
+            if head < N_Q:
+                dst = q_ptr + row * N_Q * HEAD_DIM + head * HEAD_DIM
+            else:
+                slot = tl.load(slot_ptr + row)
+                dst = key_cache_ptr + slot * (N_KV * HEAD_DIM) + (head - N_Q) * HEAD_DIM
+            tl.store(dst + offs, r1)
+            tl.store(dst + HALF + offs, r2)
+        else:
+            slot = tl.load(slot_ptr + row)
+            dst = value_cache_ptr + slot * (N_KV * HEAD_DIM) + (head - N_Q - N_KV) * HEAD_DIM
+            tl.store(dst + offs, x1)
+            tl.store(dst + HALF + offs, x2)
 
 
 def next_power_of_two(value):
@@ -89,3 +151,22 @@ def silu_mul(gate_up):
     block = 1024
     _silu_mul_kernel[(rows, -(-width // block))](gate_up, out, width, BLOCK=block, num_warps=4)
     return out
+
+
+def qkv_norm_rotary_write(qkv, norm_weight, cosine, signed_sine, slot_mapping, key_cache, value_cache, n_query_heads, n_kv_heads, head_dim, eps):
+    """Q/K normalization + rotary and the KV-cache write for one decode token per row, in one kernel launch on CUDA.
+
+    Replaces about nine small launches per layer (rms_norm, weight multiply, rotary muls/cat/addcmul, two index_copy_).
+    Falls back to `qkv_norm_rotary_write_reference` when Triton/CUDA, contiguity, dtype or head size do not allow it.
+    """
+    usable = (TRITON_AVAILABLE and qkv.is_cuda and qkv.is_contiguous() and key_cache.is_contiguous() and value_cache.is_contiguous()
+              and head_dim >= 2 and head_dim & (head_dim - 1) == 0 and cosine.dtype == qkv.dtype and signed_sine.dtype == qkv.dtype
+              and key_cache.dtype == qkv.dtype and (norm_weight is None or norm_weight.dtype == qkv.dtype))
+    if not usable:
+        return qkv_norm_rotary_write_reference(qkv, norm_weight, cosine, signed_sine, slot_mapping, key_cache, value_cache, n_query_heads, n_kv_heads, head_dim, eps)
+    rows = qkv.shape[0]
+    q = torch.empty(rows, n_query_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+    _qkv_norm_rotary_write_kernel[(rows, n_query_heads + 2 * n_kv_heads)](
+        qkv, qkv if norm_weight is None else norm_weight.contiguous(), cosine.contiguous(), signed_sine.contiguous(), slot_mapping, q, key_cache, value_cache, eps,
+        N_Q=n_query_heads, N_KV=n_kv_heads, HEAD_DIM=head_dim, HAS_NORM=norm_weight is not None, num_warps=1)
+    return q

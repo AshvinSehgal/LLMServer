@@ -69,3 +69,56 @@ def test_triton_silu_mul_matches_reference(dtype, rows, width):
     torch.manual_seed(0)
     gate_up = torch.randn(rows, 1, 2 * width, device="cuda", dtype=dtype)
     assert torch.allclose(silu_mul(gate_up).float(), silu_mul_reference(gate_up).float(), atol=2e-2, rtol=2e-2)
+
+
+def _qkv_case(dtype, qk_norm, device="cpu", rows=3, n_q=4, n_kv=2, head_dim=16):
+    from utils.attention import SelfAttention
+    from utils.kv_cache import PagedKVCache
+    torch.manual_seed(1)
+    attention = SelfAttention(32, n_q, n_kv, head_dim, bias=False, attention_scaling=head_dim ** -0.5, rms_norm_eps=1e-6, qk_norm=qk_norm).to(device=device, dtype=dtype).eval()
+    for parameter in attention.parameters():
+        torch.nn.init.normal_(parameter, std=0.3)
+    attention.fuse_projections()
+    hidden = torch.randn(rows, 1, 32, device=device, dtype=dtype)
+    angle = torch.rand(rows, 1, head_dim // 2, device=device) * 3
+    cosine = torch.cat([angle.cos()] * 2, dim=-1).to(dtype)
+    sine = torch.cat([angle.sin()] * 2, dim=-1).to(dtype)
+    signed = torch.cat([-sine[..., :head_dim // 2], sine[..., head_dim // 2:]], dim=-1)
+    cache = PagedKVCache(num_layers=1, num_blocks=6, block_size=4, num_kv_heads=n_kv, head_dim=head_dim, device=device, dtype=dtype)
+    slots = torch.tensor([21, 3, 10][:rows], device=device)
+    return attention, hidden, (cosine, sine, signed), cache, slots
+
+
+@pytest.mark.parametrize("qk_norm", [True, False])
+def test_qkv_write_reference_matches_project_qkv_path(qk_norm):
+    from utils.fused_ops import qkv_norm_rotary_write_reference
+    attention, hidden, pos, cache, slots = _qkv_case(torch.float32, qk_norm)
+    with torch.no_grad():
+        Q, K, V = attention.project_qkv(hidden, pos)
+        cache.write_slots(0, slots, K[:, :, 0, :], V[:, :, 0, :])
+        expected_keys, expected_values = cache.key_cache.clone(), cache.value_cache.clone()
+        cache.key_cache.zero_(); cache.value_cache.zero_()
+        qkv = attention.qkv_proj(hidden)
+        weight = attention.qk_norm_weight(qkv) if qk_norm else None
+        query = qkv_norm_rotary_write_reference(qkv, weight, pos[0], pos[2], slots, cache.key_cache[0], cache.value_cache[0], 4, 2, 16, 1e-6)
+    assert torch.allclose(query, Q[:, :, 0, :], atol=1e-6)
+    assert torch.allclose(cache.key_cache, expected_keys, atol=1e-6) and torch.allclose(cache.value_cache, expected_values)
+
+
+@cuda_only
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("qk_norm", [True, False])
+def test_qkv_write_kernel_matches_reference(dtype, qk_norm):
+    from utils.fused_ops import qkv_norm_rotary_write, qkv_norm_rotary_write_reference
+    attention, hidden, pos, cache, slots = _qkv_case(dtype, qk_norm, device="cuda")
+    with torch.no_grad():
+        qkv = attention.qkv_proj(hidden)
+        weight = attention.qk_norm_weight(qkv) if qk_norm else None
+        expected = qkv_norm_rotary_write_reference(qkv, weight, pos[0], pos[2], slots, cache.key_cache[0], cache.value_cache[0], 4, 2, 16, 1e-6)
+        expected_keys, expected_values = cache.key_cache.clone(), cache.value_cache.clone()
+        cache.key_cache.zero_(); cache.value_cache.zero_()
+        got = qkv_norm_rotary_write(qkv, weight, pos[0], pos[2], slots, cache.key_cache[0], cache.value_cache[0], 4, 2, 16, 1e-6)
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 2e-3
+    assert torch.allclose(got.float(), expected.float(), atol=tolerance)
+    assert torch.allclose(cache.key_cache.float(), expected_keys.float(), atol=tolerance)
+    assert torch.equal(cache.value_cache, expected_values)

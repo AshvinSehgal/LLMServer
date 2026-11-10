@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.layers import RMSNorm, apply_rotary_embedding
+from utils.fused_ops import qkv_norm_rotary_write
 from utils.paged_attention import paged_decode_attention, DEFAULT_NUM_SPLITS
 
 def joint_rotary(qk, cosine, signed_sine):
@@ -45,6 +46,7 @@ class SelfAttention(nn.Module):
         self.batched_decode = True
         self.grouped_single_decode = True
         self.joint_qk_rotary = True
+        self.fused_qkv_write = False  # set via Model.fused_decode_ops; decode: one kernel for Q/K norm + rotary + KV-cache write (CUDA; plain ops elsewhere)
         self._qk_norm_weight = None
         self._qk_norm_key = None
 
@@ -157,10 +159,17 @@ class SelfAttention(nn.Module):
         seq_lens: [rows] int32 context lengths including the new token.
         """
         batch_size = hidden_states.shape[0]
-        Q, K, V = self.project_qkv(hidden_states, pos_embeddings)
-        kv_cache.write_slots(layer_index, slot_mapping, K[:, :, 0, :], V[:, :, 0, :])
+        if self.fused_qkv_write and self.qkv_proj is not None and len(pos_embeddings) > 2 and (self.q_norm is None or (self.q_norm.use_native and self.k_norm.use_native)):
+            qkv = self.qkv_proj(hidden_states)
+            norm_weight = None if self.q_norm is None else self.qk_norm_weight(qkv)
+            query = qkv_norm_rotary_write(qkv, norm_weight, pos_embeddings[0], pos_embeddings[2], slot_mapping, kv_cache.key_cache[layer_index], kv_cache.value_cache[layer_index],
+                                          self.n_query_heads, self.n_kv_heads, self.head_dim, self.q_norm.eps if self.q_norm is not None else 0.0)
+        else:
+            Q, K, V = self.project_qkv(hidden_states, pos_embeddings)
+            kv_cache.write_slots(layer_index, slot_mapping, K[:, :, 0, :], V[:, :, 0, :])
+            query = Q[:, :, 0, :]
         attention = paged_decode_attention(
-            Q[:, :, 0, :], kv_cache.key_cache[layer_index], kv_cache.value_cache[layer_index], block_tables, seq_lens, self.attention_scaling,
+            query, kv_cache.key_cache[layer_index], kv_cache.value_cache[layer_index], block_tables, seq_lens, self.attention_scaling,
             num_splits=getattr(kv_cache, "paged_num_splits", DEFAULT_NUM_SPLITS), tokens_per_split=getattr(kv_cache, "paged_tokens_per_split", None))
         return self.o_proj(attention.reshape(batch_size, 1, -1))
 

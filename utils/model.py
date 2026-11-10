@@ -58,6 +58,16 @@ class Model(nn.Module):
             return self.embed_tokens(input_ids.cpu()).to(input_ids.device)
         return self.embed_tokens(input_ids)
 
+    @property
+    def fused_decode_ops(self):
+        return self._fused_decode_ops
+
+    @fused_decode_ops.setter
+    def fused_decode_ops(self, enabled):
+        self._fused_decode_ops = enabled
+        for layer in getattr(self, "layers", ()):
+            layer.self_attn.fused_qkv_write = enabled
+
     def fuse_projections(self):
         for layer in self.layers:
             layer.self_attn.fuse_projections()
