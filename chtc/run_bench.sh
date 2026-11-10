@@ -23,6 +23,13 @@ ROOT="$PWD"
 # cache setup (vLLM's model inspection died on this); a USER/LOGNAME variable is consulted first.
 export USER="${USER:-condor}" LOGNAME="${LOGNAME:-${USER:-condor}}"
 export TORCHINDUCTOR_CACHE_DIR="$PWD/.inductor_cache" TRITON_CACHE_DIR="$PWD/.triton_cache"
+# HTCondor hands the job its GPU as a UUID in CUDA_VISIBLE_DEVICES, but vLLM 0.11 parses that variable as an integer and crashes
+# (ValueError: invalid literal for int() ... 'GPU-65404a9b-...'). Translate it to the GPU's index, which every library accepts.
+case "${CUDA_VISIBLE_DEVICES:-}" in
+  GPU-*|MIG-*)
+    GPU_INDEX="$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null | awk -F', *' -v wanted="$CUDA_VISIBLE_DEVICES" '$2 == wanted {print $1; exit}')"
+    if [ -n "$GPU_INDEX" ]; then export CUDA_VISIBLE_DEVICES="$GPU_INDEX"; else echo "WARNING: could not map $CUDA_VISIBLE_DEVICES to a GPU index" >&2; fi ;;
+esac
 RESULTS="$ROOT/results"
 mkdir -p "$RESULTS"
 STATUS="$RESULTS/STATUS.txt"
