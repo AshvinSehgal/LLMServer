@@ -39,3 +39,13 @@ wandb/
 .DS_Store
 .idea/
 .vscode/
+
+chtc/llmserver.tar.gz
+chtc/job_*
+chtc/results/
+results/
+bench_results/
+chtc/*.log
+chtc/*.out
+chtc/*.err
+llmserver_results.tar.gz

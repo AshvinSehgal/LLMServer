@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from utils.layers import RMSNorm, RotaryEmbedding, MLP, quantize_linear_layers
 from utils.attention import SelfAttention
+from utils.fused_ops import add_rms_norm, fused_ops_usable
 
 class DecoderLayer(nn.Module):
     def __init__(self, hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=False, decode_attention="direct"):
@@ -33,6 +34,12 @@ class DecoderLayer(nn.Module):
         hidden_states = residual + mlp_output
         return hidden_states
 
+    def forward_decode_paged(self, hidden_states, pos_embeddings, kv_cache, layer_index, slot_mapping, block_tables, seq_lens):
+        residual = hidden_states
+        attention_output = self.self_attn.forward_decode_paged(self.input_layernorm(residual), pos_embeddings, kv_cache, layer_index, slot_mapping, block_tables, seq_lens)
+        hidden_states = residual + attention_output
+        return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+
 class Model(nn.Module):
     def __init__(self, vocab_size, hidden_size, intermediate_size, n_hidden_layers, head_dim, rope_theta, n_query_heads, n_kv_heads, bias, attention_scaling, rms_norm_eps, use_sdpa=False, decode_attention="direct"):
         super().__init__()
@@ -42,6 +49,7 @@ class Model(nn.Module):
             DecoderLayer(hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=use_sdpa, decode_attention=decode_attention)
             for _ in range(n_hidden_layers)])
         self.norm = RMSNorm(hidden_size, rms_norm_eps)
+        self.fused_decode_ops = False  # set by the engine when the fused CUDA kernels are usable
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def fuse_projections(self):
@@ -49,6 +57,32 @@ class Model(nn.Module):
             layer.self_attn.fuse_projections()
             layer.mlp.fuse_projections()
         
+    def forward_decode_paged(self, input_ids, pos_ids, slot_mapping, block_tables, seq_lens, kv_cache_manager):
+        """Decode one token per row against the paged cache using only tensor inputs (CUDA-graph friendly).
+
+        input_ids, pos_ids: [rows, 1]; slot_mapping: [rows]; block_tables: [rows, max_blocks]; seq_lens: [rows].
+        Returns logits [rows, vocab].
+        """
+        hidden_states = self.embed_tokens(input_ids.long())
+        cosine, sine = self.rotary_embedding(hidden_states, pos_ids)
+        half_dim = sine.shape[-1] // 2
+        pos_embeddings = (cosine, sine, torch.cat([-sine[..., :half_dim], sine[..., half_dim:]], dim=-1))
+        slot_mapping = slot_mapping.long()
+        if self.fused_decode_ops and self.layers[0].mlp.gate_up_proj is not None:
+            # Residual add + RMSNorm and SiLU*up each run as one kernel; the residual stream stays in `hidden_states`.
+            eps = self.norm.eps
+            hidden_states, normed = add_rms_norm(hidden_states, None, self.layers[0].input_layernorm.weight, eps)
+            for layer_index, layer in enumerate(self.layers):
+                attention_output = layer.self_attn.forward_decode_paged(normed, pos_embeddings, kv_cache_manager, layer_index, slot_mapping, block_tables, seq_lens)
+                hidden_states, normed = add_rms_norm(hidden_states, attention_output, layer.post_attention_layernorm.weight, eps)
+                mlp_output = layer.mlp.forward_fused(normed)
+                next_weight = self.layers[layer_index + 1].input_layernorm.weight if layer_index + 1 < len(self.layers) else self.norm.weight
+                hidden_states, normed = add_rms_norm(hidden_states, mlp_output, next_weight, eps)
+            return self.project_logits(normed[:, 0])
+        for layer_index, layer in enumerate(self.layers):
+            hidden_states = layer.forward_decode_paged(hidden_states, pos_embeddings, kv_cache_manager, layer_index, slot_mapping, block_tables, seq_lens)
+        return self.project_logits(self.norm(hidden_states[:, 0]))
+
     def quantize(self, mode="int8"):
         """Replace every Linear (including lm_head) with a weight-only quantized layer; embeddings and norms stay in the model dtype."""
         quantize_linear_layers(self, mode)

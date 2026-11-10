@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.layers import RMSNorm, apply_rotary_embedding
+from utils.paged_attention import paged_decode_attention, DEFAULT_NUM_SPLITS
 
 def joint_qk_norm_rotary(qk, weight, cosine, signed_sine, eps):
     """RMS-normalize and rotate stacked Q/K heads ([batch, seq, heads, head_dim]) in one pass."""
@@ -9,6 +10,9 @@ def joint_qk_norm_rotary(qk, weight, cosine, signed_sine, eps):
     half = qk.shape[-1] // 2
     # Swapping the halves is cheaper as a slice-and-concatenate than as a gather; the sign lives in signed_sine.
     return torch.addcmul(qk * cosine.unsqueeze(2), torch.cat([qk[..., half:], qk[..., :half]], dim=-1), signed_sine.unsqueeze(2))
+
+# SDPA's enable_gqa (grouped KV heads without duplicating them) arrived in PyTorch 2.5.
+SDPA_SUPPORTS_GQA = tuple(int(part) for part in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 5)
 
 class SelfAttention(nn.Module):
 
@@ -96,7 +100,8 @@ class SelfAttention(nn.Module):
         output = F.scaled_dot_product_attention(grouped_query, keys.unsqueeze(2), values.unsqueeze(2), attn_mask=attention_mask, dropout_p=0.0, scale=self.attention_scaling)
         return output.reshape(batch_size, self.n_query_heads, query.shape[2], self.head_dim)
 
-    def forward(self, hidden_states, pos_embeddings, causal_mask, kv_cache=None, layer_index=None, request_ids=None, block_tables=None, start_pos=None, input_lens=None, packed=False):
+    def project_qkv(self, hidden_states, pos_embeddings):
+        """Project to Q, K, V ([batch, heads, seq, head_dim] views) with Q/K normalization and rotary embedding applied."""
         batch_size, seq_len, _ = hidden_states.shape
         n_qk_heads = self.n_query_heads + self.n_kv_heads
         if self.qkv_proj is None:
@@ -128,6 +133,25 @@ class SelfAttention(nn.Module):
             Q = self.q_norm(Q)
             K = self.k_norm(K)
             Q, K = apply_rotary_embedding(Q, K, cosine, sine)
+        return Q, K, V
+
+    def forward_decode_paged(self, hidden_states, pos_embeddings, kv_cache, layer_index, slot_mapping, block_tables, seq_lens):
+        """One decode token per row. Only tensors drive the shapes, so this is safe to capture in a CUDA graph.
+
+        slot_mapping: [rows] int64 flat cache slots for the new tokens; block_tables: [rows, max_blocks] int32;
+        seq_lens: [rows] int32 context lengths including the new token.
+        """
+        batch_size = hidden_states.shape[0]
+        Q, K, V = self.project_qkv(hidden_states, pos_embeddings)
+        kv_cache.write_slots(layer_index, slot_mapping, K[:, :, 0, :], V[:, :, 0, :])
+        attention = paged_decode_attention(
+            Q[:, :, 0, :], kv_cache.key_cache[layer_index], kv_cache.value_cache[layer_index], block_tables, seq_lens, self.attention_scaling,
+            num_splits=getattr(kv_cache, "paged_num_splits", DEFAULT_NUM_SPLITS), tokens_per_split=getattr(kv_cache, "paged_tokens_per_split", None))
+        return self.o_proj(attention.reshape(batch_size, 1, -1))
+
+    def forward(self, hidden_states, pos_embeddings, causal_mask, kv_cache=None, layer_index=None, request_ids=None, block_tables=None, start_pos=None, input_lens=None, packed=False):
+        batch_size, seq_len, _ = hidden_states.shape
+        Q, K, V = self.project_qkv(hidden_states, pos_embeddings)
         if self.n_query_heads % self.n_kv_heads != 0:
             raise ValueError(f"Number of query heads must be divisible by the number of KV heads: query heads: {self.n_query_heads}, KV heads: {self.n_kv_heads}")
         group_size = self.n_query_heads // self.n_kv_heads
@@ -198,7 +222,7 @@ class SelfAttention(nn.Module):
                         else:
                             attention_scores[batch_index:batch_index + 1, :, :request_input_len, :] = request_attention_scores
                     else:
-                        if self.use_sdpa and request_start_pos == 0:
+                        if self.use_sdpa and request_start_pos == 0 and SDPA_SUPPORTS_GQA:
                             # First chunk: the keys are exactly this call's keys, so skip the cache read-back,
                             # the KV-head duplication and the explicit mask (padding rows are sliced away).
                             request_attention_scores = F.scaled_dot_product_attention(request_q, new_keys.unsqueeze(0), new_values.unsqueeze(0), dropout_p=0.0, scale=self.attention_scaling, is_causal=True, enable_gqa=True)

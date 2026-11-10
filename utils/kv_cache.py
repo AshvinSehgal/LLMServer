@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from collections import deque, OrderedDict
 import math
@@ -86,6 +87,8 @@ class PagedKVCache:
         cache_shape = (num_layers, num_blocks, block_size, num_kv_heads, head_dim)
         self.key_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
         self.value_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
+        self.vectorized_prefill_write = torch.device(device).type == "cuda"
+        self.slot_memo = {}
         self.free_blocks = deque(range(self.num_blocks))
         self.block_references = [0] * self.num_blocks
         self.num_free_blocks = self.num_blocks
@@ -233,6 +236,13 @@ class PagedKVCache:
         num_new_tokens = new_keys.shape[1]
         if num_new_tokens <= 0:
             raise ValueError(f"Cannot append zero tokens: {num_new_tokens}")
+        if self.vectorized_prefill_write and num_new_tokens > 1:
+            # One scatter per tensor instead of two small copies per touched block: with 16-token blocks a
+            # 1024-token prompt otherwise launches thousands of tiny kernels per forward pass.
+            slots = self.prefill_slots(block_table, start_pos, num_new_tokens)
+            self.key_cache[layer_index].view(-1, self.num_kv_heads, self.head_dim).index_copy_(0, slots, new_keys.permute(1, 0, 2).contiguous())
+            self.value_cache[layer_index].view(-1, self.num_kv_heads, self.head_dim).index_copy_(0, slots, new_values.permute(1, 0, 2).contiguous())
+            return
         new_token_index = 0
         while new_token_index < num_new_tokens:
             token_pos = start_pos + new_token_index
@@ -243,6 +253,43 @@ class PagedKVCache:
             self.key_cache[layer_index, physical_block, target_slice].copy_(new_keys[:, source_slice].permute(1, 0, 2))
             self.value_cache[layer_index, physical_block, target_slice].copy_(new_values[:, source_slice].permute(1, 0, 2))
             new_token_index += tokens_in_block
+
+    def prefill_slots(self, block_table, start_pos, num_tokens):
+        """Device tensor of flat cache slots for tokens [start_pos, start_pos + num_tokens), allocating blocks as needed.
+
+        The result depends only on (block table contents, start, count), so it is memoized: every layer of a forward
+        pass asks for the same range.
+        """
+        last_block = (start_pos + num_tokens - 1) // self.block_size
+        if last_block >= len(block_table):
+            for logical_block in range(len(block_table), last_block + 1):
+                self.ensure_token_block(block_table, max(start_pos, logical_block * self.block_size))
+        key = (tuple(block_table), start_pos, num_tokens)
+        slots = self.slot_memo.get(key)
+        if slots is None:
+            if len(self.slot_memo) >= 256:
+                self.slot_memo.clear()
+            positions = np.arange(start_pos, start_pos + num_tokens)
+            blocks = np.asarray(block_table, dtype=np.int64)[positions // self.block_size]
+            slots = torch.from_numpy(blocks * self.block_size + positions % self.block_size).to(self.key_cache.device)
+            self.slot_memo[key] = slots
+        return slots
+
+    def slot_for(self, block_table, token_pos):
+        """Flat cache slot (block * block_size + offset) for a token, allocating its block if needed."""
+        physical_block, block_offset = self.ensure_token_block(block_table, token_pos)
+        return physical_block * self.block_size + block_offset
+
+    def write_slots(self, layer_index, slot_mapping, keys, values):
+        """Write one new token per row. keys/values: [rows, num_kv_heads, head_dim]; slot_mapping: [rows] int64 flat slots.
+
+        Uses device-side indices only (no Python shapes), so it can be captured in a CUDA graph. Rows that share a slot
+        must carry identical data (padded graph rows duplicate row 0).
+        """
+        flat_keys = self.key_cache[layer_index].view(-1, self.num_kv_heads, self.head_dim)
+        flat_values = self.value_cache[layer_index].view(-1, self.num_kv_heads, self.head_dim)
+        flat_keys.index_copy_(0, slot_mapping, keys)
+        flat_values.index_copy_(0, slot_mapping, values)
 
     def get(self, layer_index, block_table, end_pos):
         if layer_index < 0 or layer_index >= self.num_layers:

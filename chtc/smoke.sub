@@ -1,0 +1,30 @@
+# Quick check (minutes): GPU unit tests + a tiny Hugging Face / custom-engine run with a kernel profile. No vLLM.
+# Look at results/STATUS.txt and results/gpu_tests.txt in the returned tarball before launching chtc/bench.sub.
+#
+# Submit from the repo root on a CHTC submit node:  condor_submit chtc/smoke.sub
+universe                = docker
+docker_image            = pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
+
+executable              = chtc/run_bench.sh
+arguments               = --prompt-tokens 128 --batch-sizes 1,8 --output-tokens 32 --repeats 2 --dtype bfloat16
+environment             = "MODEL_ID=Qwen/Qwen3-1.7B BACKENDS=hf,custom RUN_TESTS=1 PROFILE=1 ABLATE=1"
+
+transfer_input_files    = utils, tests, benchmark.py, benchmark_cuda.py
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+transfer_output_files   = llmserver_results.tar.gz
+
+log                     = chtc/smoke_$(Cluster).log
+output                  = chtc/smoke_$(Cluster).out
+error                   = chtc/smoke_$(Cluster).err
+
+request_gpus            = 1
+request_cpus            = 4
+request_memory          = 16GB
+request_disk            = 30GB
++WantGPULab             = true
++GPUJobLength           = "short"
+gpus_minimum_capability = 8.0
+gpus_minimum_memory     = 24000
+
+queue

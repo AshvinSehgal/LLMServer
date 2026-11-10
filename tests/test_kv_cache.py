@@ -1104,3 +1104,24 @@ def test_kv_cache_manager_rejects_invalid_max_sequence_length():
     manager = KVCacheManager(num_layers=3, num_kv_heads=2, head_dim=4, device=torch.device("cpu"), dtype=torch.float32)
     with pytest.raises(ValueError):
         manager.allocate("req-1", max_seq_length=0)
+
+
+def test_vectorized_prefill_write_matches_block_loop():
+    import torch
+    from utils.kv_cache import PagedKVCache
+    torch.manual_seed(0)
+    results = []
+    for vectorized in (False, True):
+        cache = PagedKVCache(num_layers=2, num_blocks=16, block_size=4, num_kv_heads=2, head_dim=8, device="cpu", dtype=torch.float32)
+        cache.vectorized_prefill_write = vectorized
+        table = [cache.allocate_block()]  # a pre-existing, partially used block
+        torch.manual_seed(1)
+        first_keys, first_values = torch.randn(2, 3, 8), torch.randn(2, 3, 8)
+        second_keys, second_values = torch.randn(2, 9, 8), torch.randn(2, 9, 8)
+        for layer in range(2):
+            cache.append(layer, table, 0, first_keys, first_values)
+            cache.append(layer, table, 3, second_keys, second_values)
+        results.append((cache.key_cache.clone(), cache.value_cache.clone(), list(table)))
+    assert results[0][2] == results[1][2]
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])

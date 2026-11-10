@@ -40,7 +40,7 @@ class Int8Linear(nn.Module):
     def forward(self, hidden_states):
         flat = hidden_states.reshape(-1, self.in_features).contiguous()
         # MPS's tiled int8 kernel (used from 16 rows) needs both dimensions to be multiples of 32.
-        kernel_supported = flat.device.type != "mps" or (self.in_features % 32 == 0 and self.out_features % 32 == 0)
+        kernel_supported = flat.device.type == "cpu" or (flat.device.type == "mps" and self.in_features % 32 == 0 and self.out_features % 32 == 0)
         if kernel_supported and flat.dtype in (torch.float16, torch.float32) and self.scale.dtype == flat.dtype:
             rows = flat.shape[0]
             if flat.device.type == "mps" and self.PAD_ROWS_FROM <= rows < self.PAD_ROWS_BELOW:
@@ -185,6 +185,11 @@ class MLP(nn.Module):
         self.gate_proj = None
         self.up_proj = None
     
+    def forward_fused(self, hidden_states):
+        """Decode-path MLP with a single SiLU*up kernel (needs fused projections)."""
+        from utils.fused_ops import silu_mul
+        return self.down_proj(silu_mul(self.gate_up_proj(hidden_states)))
+
     def forward(self, hidden_states):
         if self.gate_up_proj is None:
             gate = self.gate_proj(hidden_states)

@@ -7,15 +7,23 @@ import math
 import hashlib
 import json
 import codecs
+import warnings
+import os
+import numpy as np
 from transformers.convert_slow_tokenizer import bytes_to_unicode
 from utils.scheduler import Scheduler
 from utils.request import Request, RequestStatus, RequestFinishReason, CompletedRequest
 from utils.batch import PrefillBatch, PackedPrefillBatch, DecodeBatch
 from utils.kv_cache import PagedKVCache, KVCacheExhaustedError
+from utils.paged_attention import triton_attention_usable, choose_tile, next_power_of_two, DEFAULT_NUM_SPLITS
+from utils.cuda_graph import CudaGraphDecodeRunner
+from utils.fused_ops import fused_ops_usable
 
 STREAM_END = None
 BYTE_LEVEL_DECODER = {character: byte for byte, character in bytes_to_unicode().items()}
 MAX_PACKED_PREFILL_TOKENS = 512
+MIN_TOKENS_PER_SPLIT = 128
+MAX_SPLITS = 64
 
 class ByteLevelStreamDecoder:
     def __init__(self, tokenizer):
@@ -35,7 +43,7 @@ class ByteLevelStreamDecoder:
         return self.utf8_decoder.decode(b"", final=True)
 
 class Engine:
-    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600, prefill_chunk_size=None, kv_cache_num_blocks=500, kv_cache_block_size=500, stream_text=True, prefill_bucketing=True, packed_prefill=True):
+    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600, prefill_chunk_size=None, kv_cache_num_blocks=500, kv_cache_block_size=500, stream_text=True, prefill_bucketing=True, packed_prefill=True, paged_decode=None, cuda_graphs=None, paged_context_limit=8192, ignore_eos=False):
         self.model = model
         self.tokenizer = tokenizer
         self.device = next(model.parameters()).device
@@ -50,6 +58,7 @@ class Engine:
             raise ValueError(f"completed_request_ttl_seconds cannot be negative: {completed_request_ttl_seconds}")
         self.max_new_tokens = max_new_tokens
         self.stream_text = stream_text
+        self.ignore_eos = ignore_eos
         self.prefill_bucketing = prefill_bucketing
         self.packed_prefill = packed_prefill
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -72,6 +81,7 @@ class Engine:
             device=self.device,
             dtype=self.dtype
         )
+        self.setup_paged_decode(paged_decode, cuda_graphs, paged_context_limit, max_batch_size)
         if self.model.generation_config.bos_token_id is not None:
             self.bos_token_id = self.model.generation_config.bos_token_id
         elif self.model.config.bos_token_id is not None:
@@ -102,6 +112,65 @@ class Engine:
         backend = getattr(self.tokenizer, "backend_tokenizer", None)
         self.byte_level_streaming = backend is not None and type(backend.decoder).__name__ == "ByteLevel" and hasattr(self.tokenizer, "convert_ids_to_tokens")
     
+    def setup_paged_decode(self, paged_decode, cuda_graphs, paged_context_limit, max_batch_size):
+        """Decode through on-device block tables (Triton kernel on CUDA, optionally replayed as a CUDA graph).
+
+        Contexts longer than paged_context_limit fall back to the gather-based decode path.
+        """
+        supported = hasattr(self.model, "forward_decode_paged")
+        on_cuda = self.device.type == "cuda"
+        self.paged_decode = bool(supported and (paged_decode if paged_decode is not None else on_cuda and triton_attention_usable(self.device)))
+        self.graph_runner = None
+        self.paged_max_blocks = 0
+        self.paged_context_limit = 0
+        if not self.paged_decode:
+            return
+        config = self.model.config
+        group = config.num_attention_heads // config.num_key_value_heads
+        tile = choose_tile(max(2, next_power_of_two(group)))
+        coverage = min(paged_context_limit, self.num_blocks * self.block_size)
+        # Small fixed slices keep many programs busy even for short contexts (idle slices exit immediately); the slice
+        # count bounds the longest context the graph can serve.
+        tokens_per_split = -(-MIN_TOKENS_PER_SPLIT // tile) * tile
+        num_splits = min(MAX_SPLITS, next_power_of_two(-(-coverage // tokens_per_split)))
+        self.kv_cache.paged_num_splits = num_splits
+        self.kv_cache.paged_tokens_per_split = tokens_per_split
+        self.paged_context_limit = num_splits * tokens_per_split
+        self.model.fused_decode_ops = fused_ops_usable(self.device) and os.environ.get("LLMSERVER_FUSED_OPS", "1") != "0"
+        self.paged_max_blocks = min(self.num_blocks, -(-self.paged_context_limit // self.block_size))
+        if (cuda_graphs if cuda_graphs is not None else on_cuda) and on_cuda:
+            self.graph_runner = CudaGraphDecodeRunner(self.model, self.kv_cache, max_batch_size, self.paged_max_blocks, self.device)
+
+    @torch.inference_mode()
+    def run_paged_decode(self, requests):
+        """Greedy next tokens for single-token decode requests, or None if this step must use the gather path."""
+        positions = [request.num_computed_tokens for request in requests]
+        if max(positions) + 1 > self.paged_context_limit or any(len(request.block_table) > self.paged_max_blocks for request in requests):
+            return None
+        slots = [self.kv_cache.slot_for(request.block_table, position) for request, position in zip(requests, positions)]
+        if any(len(request.block_table) > self.paged_max_blocks for request in requests):
+            return None
+        token_ids = [request.generated_token_ids[-1] for request in requests]
+        lengths = [position + 1 for position in positions]
+        tables = np.zeros((len(requests), self.paged_max_blocks), dtype=np.int32)
+        for row, request in enumerate(requests):
+            tables[row, :len(request.block_table)] = request.block_table
+        if self.graph_runner is not None and len(requests) <= self.graph_runner.max_batch_size:
+            try:
+                return self.graph_runner.run(token_ids, positions, slots, lengths, tables)
+            except Exception as error:
+                warnings.warn(f"CUDA graph decode failed ({error!r}); falling back to eager paged decode")
+                self.graph_runner = None
+        device = self.device
+        logits = self.model.forward_decode_paged(
+            torch.tensor(token_ids, device=device, dtype=torch.long).unsqueeze(1),
+            torch.tensor(positions, device=device, dtype=torch.long).unsqueeze(1),
+            torch.tensor(slots, device=device, dtype=torch.long),
+            torch.from_numpy(tables).to(device),
+            torch.tensor(lengths, device=device, dtype=torch.int32),
+            self.kv_cache)
+        return self.sample_batch(logits)
+
     def hash(self, parent_hash, tokens, model_identity, adapter_id):
         payload = json.dumps([parent_hash, tokens, model_identity, adapter_id], separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
@@ -119,9 +188,13 @@ class Engine:
             request.num_computed_tokens += self.block_size
             parent_hash = digest
 
-    def add_request(self, prompt):
+    def add_request(self, prompt, prompt_token_ids=None):
         self.prune_completed_requests()
-        if not prompt or prompt.strip() == "":
+        if prompt_token_ids is not None:
+            prompt_token_ids = list(prompt_token_ids)
+            if not prompt_token_ids:
+                raise ValueError("prompt_token_ids must not be empty")
+        elif not prompt or prompt.strip() == "":
             prompt_token_ids = [self.bos_token_id]
         else:
             prompt_token_ids = self.tokenizer(prompt)["input_ids"]
@@ -203,7 +276,7 @@ class Engine:
         return next_token_ids.tolist()
     
     def check_stopping(self, request, token_id):
-        if token_id in self.eos_token_ids:
+        if token_id in self.eos_token_ids and not self.ignore_eos:
             request.finish(RequestFinishReason.EOS)
         elif len(request.generated_token_ids) >= request.max_new_tokens:
             request.finish(RequestFinishReason.LENGTH)
@@ -242,9 +315,11 @@ class Engine:
     def process_decode_batch(self, scheduler_output):
         if not scheduler_output.decode_requests:
             return
-        decode_batch = DecodeBatch(scheduler_output.decode_requests, self.device, self.dtype)
-        logits = self.process_batch(decode_batch, list(range(decode_batch.batch_size)))
-        next_token_ids = self.sample_batch(logits)
+        next_token_ids = self.run_paged_decode(scheduler_output.decode_requests) if self.paged_decode else None
+        if next_token_ids is None:
+            decode_batch = DecodeBatch(scheduler_output.decode_requests, self.device, self.dtype)
+            logits = self.process_batch(decode_batch, list(range(decode_batch.batch_size)))
+            next_token_ids = self.sample_batch(logits)
         for request, token_id in zip(scheduler_output.decode_requests, next_token_ids):
             request.complete_decode()
             self.accept_generated_token(request, token_id)

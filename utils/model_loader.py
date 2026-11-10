@@ -2,10 +2,11 @@ import torch
 from transformers import AutoModelForCausalLM
 import gc
 from utils.model import Model
+from utils.layers import quantize_linear_layers
 
 def resolve_decode_attention(device, decode_attention):
     if decode_attention is None:
-        return "gather_sdpa" if torch.device(device).type == "mps" else "direct"
+        return "gather_sdpa" if torch.device(device).type in ("mps", "cuda") else "direct"
     if decode_attention not in ("direct", "gather_sdpa"):
         raise ValueError(f"Unknown decode attention path: {decode_attention}")
     return decode_attention
@@ -21,7 +22,8 @@ def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa
         else:
             device = torch.device("cpu")
     decode_attention = resolve_decode_attention(device, decode_attention)
-    model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager").eval()
+    # Load straight into the target dtype: a float32 copy of a 4B model is 16 GB, which exhausts a 16 GB Mac before the engine even starts.
+    model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", **({"dtype": dtype} if dtype is not None else {})).eval()
     config = model.config
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     qwen_attention = model.model.layers[0].self_attn
@@ -60,12 +62,21 @@ def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa
     del qwen_attention
     del model
     gc.collect()
-    my_model.to(device=device, dtype=dtype)
+    # Cast and fuse on the CPU, then move to the device one decoder layer at a time, quantizing each as it arrives. Doing the
+    # concatenations on the GPU at full model size corrupted weights on a 16 GB Mac (Qwen3-4B), and moving everything before
+    # quantizing needed the unquantized model plus the quantized one in GPU memory at once.
+    my_model.to(dtype=dtype)
     if fuse_projections:
         my_model.fuse_projections()
-    if quantize is not None:
-        my_model.quantize(quantize)
+    for layer in my_model.layers:
+        layer.to(device=device)
+        if quantize is not None:
+            quantize_linear_layers(layer, quantize)
         gc.collect()
-        if torch.device(device).type == "mps":
-            torch.mps.empty_cache()
+    my_model.to(device=device)
+    if quantize is not None:
+        quantize_linear_layers(my_model, quantize)  # embeddings' tied vocabulary projection; decoder layers are already quantized
+        gc.collect()
+    if torch.device(device).type == "mps":
+        torch.mps.empty_cache()
     return my_model
