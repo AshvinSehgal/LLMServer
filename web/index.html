@@ -75,6 +75,19 @@
   #send.stop { background: var(--text); color: var(--bg); }
   #send:disabled { opacity: .4; cursor: default; }
   #hint { text-align: center; font-size: 11px; color: var(--muted); margin-top: 6px; }
+  #toolbar { display: flex; align-items: center; gap: 14px; margin-top: 8px; padding: 0 4px; flex-wrap: wrap; }
+  .select select { font: inherit; font-size: 13px; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; cursor: pointer; }
+  .select select:disabled { opacity: .5; cursor: default; }
+  .toggle { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; cursor: pointer; user-select: none; }
+  .toggle input { position: absolute; opacity: 0; pointer-events: none; }
+  .toggle .track { width: 30px; height: 17px; border-radius: 999px; background: var(--border); position: relative; transition: background .15s; flex-shrink: 0; }
+  .toggle .track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: #fff; transition: transform .15s; }
+  .toggle input:checked + .track { background: var(--accent); }
+  .toggle input:checked + .track::after { transform: translateX(13px); }
+  .toggle input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .toggle.disabled { opacity: .45; cursor: default; }
+  #modelStatus { font-size: 12px; color: var(--muted); }
+  #modelStatus.error { color: #c0392b; }
   @media (max-width: 760px) {
     #sidebar { position: fixed; z-index: 5; inset: 0 auto 0 0; transform: translateX(-100%); transition: transform .2s; }
     #sidebar.open { transform: none; }
@@ -99,13 +112,21 @@
   <div id="settings">
     <label>System prompt<textarea id="systemPrompt" placeholder="Optional instructions for the assistant"></textarea></label>
     <label>Max reply tokens<input type="number" id="maxTokens" min="1" step="64" value="1024"></label>
-    <label class="check"><input type="checkbox" id="thinking"> Let the model think first (slower)</label>
   </div>
   <div id="messages"></div>
   <div id="composer">
     <div id="box">
       <textarea id="input" rows="1" placeholder="Message your local model…"></textarea>
       <button id="send" aria-label="Send">↑</button>
+    </div>
+    <div id="toolbar">
+      <label class="select" title="Model (only one is loaded at a time, so switching takes a moment)">
+        <select id="modelSelect" aria-label="Model"></select>
+      </label>
+      <label class="toggle" id="thinkingToggle" title="Let the model reason before answering (slower)">
+        <input type="checkbox" id="thinking"><span class="track"></span><span>Thinking</span>
+      </label>
+      <span id="modelStatus"></span>
     </div>
     <div id="hint">Enter to send · Shift+Enter for a new line · greedy decoding (temperature is not used)</div>
   </div>
@@ -121,6 +142,7 @@ let chats = store.get("chats", []);
 let currentId = store.get("currentId", null);
 let settings = Object.assign({ systemPrompt: "", maxTokens: 1024, thinking: false }, store.get("settings", {}));
 let abortController = null;
+let modelState = { models: [], current: null, loading: null, switchable: false };
 let generating = false;
 
 const escapeHtml = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -262,6 +284,62 @@ document.addEventListener("click", (event) => {
   }
 });
 
+function currentModel() { return modelState.models.find((m) => m.id === modelState.current) || null; }
+function renderModelBar() {
+  const select = $("modelSelect"), status = $("modelStatus"), model = currentModel();
+  select.innerHTML = "";
+  for (const m of modelState.models) {
+    const option = document.createElement("option");
+    option.value = m.id; option.textContent = m.label;
+    select.appendChild(option);
+  }
+  select.value = modelState.loading || modelState.current || "";
+  const busy = generating || !!modelState.loading;
+  select.disabled = busy || !modelState.switchable || modelState.models.length < 2;
+  const thinkingOk = !!(model && model.thinking) && !modelState.loading;
+  $("thinking").disabled = !thinkingOk;
+  $("thinkingToggle").classList.toggle("disabled", !thinkingOk);
+  $("thinkingToggle").title = model && !model.thinking ? `${model.label} has no thinking mode` : "Let the model reason before answering (slower)";
+  $("thinking").checked = thinkingOk && settings.thinking;
+  if (modelState.loading) {
+    const target = modelState.models.find((m) => m.id === modelState.loading);
+    status.className = ""; status.textContent = `Loading ${target ? target.label : modelState.loading}… (the first load of a model also downloads it)`;
+  } else if (modelState.error) {
+    status.className = "error"; status.textContent = modelState.error;
+  } else {
+    status.className = ""; status.textContent = "";
+  }
+  $("send").disabled = !!modelState.loading;
+  $("input").placeholder = modelState.loading ? "Loading the model…" : "Message your local model…";
+}
+async function refreshModels() {
+  try {
+    modelState = Object.assign(modelState, await (await fetch("/api/models")).json());
+  } catch (e) { modelState.error = "Server unreachable"; }
+  renderModelBar();
+  const info = await fetch("/api/info").then((r) => r.json()).catch(() => null);
+  if (info && info.model) {
+    $("modelName").textContent = info.model;
+    $("deviceName").textContent = `${info.device || "loading"} · ${info.max_context} token context`;
+  }
+}
+async function switchModel(id) {
+  if (generating || id === modelState.current) return;
+  modelState.loading = id; modelState.error = null;
+  renderModelBar();
+  const poll = setInterval(refreshModels, 2000);
+  try {
+    const response = await fetch("/api/model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try { detail = (await response.json()).detail || detail; } catch (e) {}
+      modelState.error = detail;
+    }
+  } catch (e) { modelState.error = "Could not reach the server: " + e.message; }
+  clearInterval(poll);
+  modelState.loading = null;
+  await refreshModels();
+}
 function setGenerating(value) {
   generating = value;
   const button = $("send");
@@ -269,6 +347,7 @@ function setGenerating(value) {
   button.textContent = value ? "■" : "↑";
   button.disabled = false;
   $("status").textContent = value ? "generating…" : "";
+  renderModelBar();
 }
 function apiMessages(chat) {
   const history = chat.messages.filter((m) => !m.error || m.content).map((m) => ({ role: m.role, content: m.role === "assistant" ? splitThinking(m.content).answer : m.content }));
@@ -289,7 +368,7 @@ async function generate(chat) {
   try {
     const response = await fetch("/v1/chat/completions", {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: abortController.signal,
-      body: JSON.stringify({ messages: history, stream: true, max_tokens: settings.maxTokens, enable_thinking: settings.thinking }),
+      body: JSON.stringify({ messages: history, stream: true, max_tokens: settings.maxTokens, enable_thinking: !!(currentModel() && currentModel().thinking) && settings.thinking }),
     });
     if (!response.ok) {
       let detail = response.statusText;
@@ -365,16 +444,15 @@ const savedTheme = store.get("theme", null);
 if (savedTheme) document.documentElement.dataset.theme = savedTheme;
 $("systemPrompt").value = settings.systemPrompt; $("maxTokens").value = settings.maxTokens; $("thinking").checked = settings.thinking;
 const persistSettings = () => {
-  settings = { systemPrompt: $("systemPrompt").value, maxTokens: Math.max(1, parseInt($("maxTokens").value, 10) || 1024), thinking: $("thinking").checked };
+  const thinkingEnabled = !$("thinking").disabled;
+  settings = { systemPrompt: $("systemPrompt").value, maxTokens: Math.max(1, parseInt($("maxTokens").value, 10) || 1024), thinking: thinkingEnabled ? $("thinking").checked : settings.thinking };
   store.set("settings", settings);
 };
 ["systemPrompt", "maxTokens", "thinking"].forEach((id) => $(id).addEventListener("change", persistSettings));
 $("systemPrompt").addEventListener("input", persistSettings);
 
-fetch("/api/info").then((r) => r.json()).then((info) => {
-  $("modelName").textContent = info.model;
-  $("deviceName").textContent = `${info.device} · ${info.max_context} token context`;
-}).catch(() => { $("modelName").textContent = "server unreachable"; });
+$("modelSelect").addEventListener("change", (event) => switchModel(event.target.value));
+refreshModels();
 render();
 $("input").focus();
 </script>

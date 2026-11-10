@@ -147,6 +147,8 @@ python server.py --model Qwen/Qwen3-1.7B            # open http://127.0.0.1:8000
 python server.py --model Qwen/Qwen3-1.7B --quantize int8 --max-context 8192
 ```
 
+Under the text box, a toolbar switches between Qwen3 1.7B, Qwen3 4B and Llama 3.2 3B (the list is `MODEL_CATALOG` in `server.py`) and toggles Qwen3's thinking mode. Only one model fits in memory, so switching unloads the current one and loads the next (about 15 s for a cached model; a first use downloads it, and Llama needs `HF_TOKEN` with the license accepted). The KV cache is sized for `--max-batch-size` (default 2) full-length conversations; raise it only if you have the memory.
+
 The UI (`web/index.html`, no build step) keeps conversations in the browser, streams tokens, shows tokens/s and time to first token, supports stop, regenerate, a system prompt, and Qwen3's optional thinking mode. Run it with the Python 3.12 environment (torch 2.14, transformers 4.56): under torch 2.11 + transformers 5.5 the output degenerates into repeated `!` and the server prints a warning. The engine decodes greedily, so `temperature`/`top_p` are accepted by the API but ignored. Follow-up messages reuse the KV blocks of earlier turns through the engine's prefix cache. Run `tests/test_server.py` for the API tests (they use a stub engine).
 
 ## Supported models

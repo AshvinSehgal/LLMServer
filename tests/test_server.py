@@ -116,3 +116,62 @@ def test_load_env_file_accepts_export_lines_and_keeps_existing_variables(tmp_pat
     assert os.environ["LLMS_TEST_KEEP"] == "already_set"
     for key in ("LLMS_TEST_TOKEN", "LLMS_TEST_PLAIN"):
         os.environ.pop(key, None)
+
+
+# ---- model switching ------------------------------------------------------------------------------------------------------------
+
+def switchable(loader_log, fail_for=()):
+    def loader(model_id):
+        loader_log.append(model_id)
+        if model_id in fail_for:
+            raise RuntimeError("gated model")
+        return FakeEngine(), FakeTokenizer()
+    service = ChatService(FakeEngine(), FakeTokenizer(), "Qwen/Qwen3-1.7B", max_context=50, loader=loader)
+    return service, TestClient(create_app(service))
+
+
+def test_model_list_has_the_three_models_and_marks_the_loaded_one():
+    service, client = switchable([])
+    body = client.get("/api/models").json()
+    assert [m["label"] for m in body["models"]] == ["Qwen3 1.7B", "Qwen3 4B", "Llama 3.2 3B"]
+    assert body["current"] == "Qwen/Qwen3-1.7B" and [m["loaded"] for m in body["models"]] == [True, False, False]
+    assert [m["thinking"] for m in body["models"]] == [True, True, False]
+
+
+def test_switching_loads_the_requested_model_and_updates_the_state():
+    log = []
+    service, client = switchable(log)
+    response = client.post("/api/model", json={"id": "meta-llama/Llama-3.2-3B-Instruct"})
+    assert response.status_code == 200 and response.json()["current"] == "meta-llama/Llama-3.2-3B-Instruct"
+    assert log == ["meta-llama/Llama-3.2-3B-Instruct"] and client.get("/api/info").json()["model"] == "meta-llama/Llama-3.2-3B-Instruct"
+    assert client.post("/api/model", json={"id": "meta-llama/Llama-3.2-3B-Instruct"}).status_code == 200 and log == ["meta-llama/Llama-3.2-3B-Instruct"]  # no reload
+
+
+def test_failed_switch_restores_the_previous_model_and_reports_the_error():
+    log = []
+    service, client = switchable(log, fail_for={"meta-llama/Llama-3.2-3B-Instruct"})
+    body = client.post("/api/model", json={"id": "meta-llama/Llama-3.2-3B-Instruct"}).json()
+    assert body["current"] == "Qwen/Qwen3-1.7B" and "gated model" in body["error"]
+    assert log == ["meta-llama/Llama-3.2-3B-Instruct", "Qwen/Qwen3-1.7B"]
+    assert client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}).status_code == 200
+
+
+def test_unknown_model_and_busy_server_are_rejected():
+    service, client = switchable([])
+    assert client.post("/api/model", json={"id": "nope/none"}).status_code == 404
+    service.active = 1
+    assert client.post("/api/model", json={"id": "Qwen/Qwen3-4B"}).status_code == 409
+
+
+def test_chat_is_refused_while_a_model_loads():
+    service, client = switchable([])
+    service.loading = "Qwen/Qwen3-4B"
+    response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 503 and "Loading" in response.json()["detail"]
+
+
+def test_requests_release_their_slot_so_switching_works_afterwards():
+    service, client = switchable([])
+    client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert service.active == 0
+    assert client.post("/api/model", json={"id": "Qwen/Qwen3-4B"}).status_code == 200
