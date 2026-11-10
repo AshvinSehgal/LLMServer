@@ -29,6 +29,9 @@ The project currently targets the Qwen3 architecture and uses Hugging Face only 
 - Optional weight-only int8 quantization (`model_loader(..., quantize="int8")`, `benchmark.py --quantize int8`): per-output-channel scales and PyTorch's `_weight_int8pack_mm`, which halves weight memory and roughly 1.8x's batch-1 decode on MPS; it is lossy, so outputs can diverge from the fp16 reference
 - Experimental int4 mode (`quantize="int4"`, MPS only): group-wise int4 decoder weights for 1-2 row decode steps, with an int8 copy for larger batches and prefill because MPS's int4 kernel is slow beyond a few rows; `lm_head` stays int8. About 25% faster than int8 at batch 1 but uses more memory than int8 and is noticeably lossy (perplexity about +22% on the test text), so it is off by default
 
+- CUDA decode path (untested on a GPU until run via CHTC): split-KV paged-attention Triton kernels that read per-request block tables on the device, slot-mapped KV writes, and CUDA-graph replay of the whole decode step per batch-size bucket (`utils/paged_attention.py`, `utils/cuda_graph.py`); pure-PyTorch references for every piece keep it testable on CPU/MPS, and contexts beyond `paged_context_limit` fall back to the gather path
+- `benchmark_cuda.py`: Hugging Face vs this engine vs vLLM on identical token IDs, one process per library, with optional ablations and a kernel profile; `chtc/` holds the HTCondor submit file and job script
+
 Prefill writes each request's keys and values into blocks referenced by its block table. Later decode steps process only the newest token and read the previously cached history directly from those blocks. Finished and cancelled requests release their block references; complete, unreferenced prompt blocks remain cached until memory pressure evicts them.
 
 ## Project structure
@@ -120,3 +123,28 @@ The gather-plus-SDPA decode path is now the default when `model_loader()` target
 The single-request model, custom transformer implementation, multi-request scheduler, paged KV cache, chunked prefill and prefix caching are implemented. The next development version focuses on profiling and faster GPU execution.
 
 This repository is a learning project rather than a production-ready inference server. The paged decode path is implemented in PyTorch; optimized kernels, distributed inference and an HTTP API are planned for later iterations.
+
+
+## Running the GPU comparison on CHTC
+
+The job files follow the pattern of the working CS771 jobs (docker universe, input directories transferred directly, one results tarball back).
+
+```bash
+chtc/transfer_to_chtc.sh <user@submit-node>     # rsync the repo (skips .env, conversation.md, caches, tarballs)
+# then, on the submit node, from the repo root:
+condor_submit chtc/smoke.sub                    # minutes: GPU unit tests + a tiny Hugging Face / custom run + kernel profile
+condor_submit chtc/bench.sub                    # full Hugging Face vs custom vs vLLM comparison
+```
+
+Each job returns `llmserver_results.tar.gz` containing `results/STATUS.txt` (summary and tables), `gpu_tests.txt` (Triton and CUDA-graph unit tests), `bench/report.md`, `bench/profile.txt` (kernel profile) and raw JSON per library. vLLM is installed into its own virtualenv inside the job so its pinned PyTorch cannot affect the other two libraries. Run `python benchmark_cuda.py --help` for options; locally it also works on MPS/CPU for the Hugging Face and custom backends.
+
+## Chat interface
+
+`server.py` serves a ChatGPT-style web UI and an OpenAI-compatible API (`/v1/chat/completions`, streaming or not) from the engine:
+
+```bash
+python server.py --model Qwen/Qwen3-1.7B            # open http://127.0.0.1:8000
+python server.py --model Qwen/Qwen3-1.7B --quantize int8 --max-context 8192
+```
+
+The UI (`web/index.html`, no build step) keeps conversations in the browser, streams tokens, shows tokens/s and time to first token, supports stop, regenerate, a system prompt, and Qwen3's optional thinking mode. Run it with the Python 3.12 environment (torch 2.14, transformers 4.56): under torch 2.11 + transformers 5.5 the output degenerates into repeated `!` and the server prints a warning. The engine decodes greedily, so `temperature`/`top_p` are accepted by the API but ignored. Follow-up messages reuse the KV blocks of earlier turns through the engine's prefix cache. Run `tests/test_server.py` for the API tests (they use a stub engine).

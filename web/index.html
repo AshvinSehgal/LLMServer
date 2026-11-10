@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLMServer Chat</title>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #f7f7f8; --border: #e5e5e8; --text: #1b1b1f; --muted: #6b6b76;
+    --accent: #d97757; --user: #efeff2; --code-bg: #f3f3f5; --think-bg: #faf6f1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1c1c1f; --panel: #232327; --border: #34343a; --text: #ececf0; --muted: #9a9aa6;
+      --user: #2c2c32; --code-bg: #141416; --think-bg: #26231f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #1c1c1f; --panel: #232327; --border: #34343a; --text: #ececf0; --muted: #9a9aa6;
+    --user: #2c2c32; --code-bg: #141416; --think-bg: #26231f;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  #sidebar { width: 260px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 12px; gap: 8px; flex-shrink: 0; }
+  #newChat { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 9px 12px; font-weight: 600; }
+  #chatList { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+  .chatItem { display: flex; align-items: center; border-radius: 8px; padding: 7px 10px; cursor: pointer; gap: 6px; }
+  .chatItem:hover, .chatItem.active { background: var(--user); }
+  .chatItem span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chatItem button { background: none; border: 0; color: var(--muted); opacity: 0; padding: 0 4px; }
+  .chatItem:hover button { opacity: 1; }
+  #sideFooter { font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 10px; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #topbar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  #menu { display: none; background: none; border: 0; font-size: 20px; }
+  #title { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pill { font-size: 12px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; }
+  #settingsBtn, #themeBtn { background: none; border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; }
+  #settings { display: none; border-bottom: 1px solid var(--border); background: var(--panel); padding: 12px 16px; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+  #settings.open { display: flex; }
+  #settings label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  #settings textarea, #settings input[type=number] { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; }
+  #settings textarea { width: 340px; height: 56px; resize: vertical; }
+  #settings input[type=number] { width: 100px; }
+  #settings .check { flex-direction: row; align-items: center; gap: 6px; font-size: 14px; color: var(--text); }
+  #messages { flex: 1; overflow-y: auto; padding: 24px 0 8px; }
+  .row { max-width: 780px; margin: 0 auto; padding: 8px 20px; }
+  .row.user .bubble { background: var(--user); border-radius: 16px; padding: 8px 14px; margin-left: auto; width: fit-content; max-width: 90%; white-space: pre-wrap; }
+  .row.assistant .bubble { padding: 4px 0; }
+  .meta { font-size: 12px; color: var(--muted); margin-top: 4px; display: flex; gap: 12px; align-items: center; }
+  .meta button { background: none; border: 0; color: var(--muted); padding: 0; font-size: 12px; }
+  .meta button:hover { color: var(--text); }
+  .bubble p { margin: 0 0 10px; } .bubble p:last-child { margin-bottom: 0; }
+  .bubble h1, .bubble h2, .bubble h3 { margin: 14px 0 6px; line-height: 1.3; }
+  .bubble ul, .bubble ol { margin: 0 0 10px; padding-left: 24px; }
+  .bubble code { background: var(--code-bg); border-radius: 4px; padding: 1px 5px; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .bubble pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px; overflow-x: auto; margin: 0 0 10px; position: relative; }
+  .bubble pre code { background: none; padding: 0; }
+  .bubble pre .copy { position: absolute; top: 6px; right: 6px; font-size: 11px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px; color: var(--muted); }
+  .bubble a { color: var(--accent); }
+  details.think { background: var(--think-bg); border: 1px solid var(--border); border-radius: 10px; padding: 6px 12px; margin-bottom: 10px; color: var(--muted); }
+  details.think summary { cursor: pointer; font-size: 13px; }
+  details.think div { margin-top: 6px; white-space: pre-wrap; font-size: 14px; }
+  .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .error { color: #c0392b; }
+  #empty { text-align: center; margin-top: 18vh; color: var(--muted); }
+  #empty h1 { color: var(--text); font-size: 28px; margin-bottom: 4px; }
+  #composer { max-width: 780px; width: 100%; margin: 0 auto; padding: 8px 20px 18px; }
+  #box { display: flex; align-items: flex-end; gap: 8px; border: 1px solid var(--border); border-radius: 16px; padding: 8px 8px 8px 14px; background: var(--bg); box-shadow: 0 1px 6px rgba(0,0,0,.06); }
+  #input { flex: 1; border: 0; outline: 0; resize: none; font: inherit; color: var(--text); background: transparent; max-height: 200px; padding: 4px 0; }
+  #send { background: var(--accent); color: #fff; border: 0; border-radius: 10px; width: 36px; height: 36px; font-size: 16px; }
+  #send.stop { background: var(--text); color: var(--bg); }
+  #send:disabled { opacity: .4; cursor: default; }
+  #hint { text-align: center; font-size: 11px; color: var(--muted); margin-top: 6px; }
+  @media (max-width: 760px) {
+    #sidebar { position: fixed; z-index: 5; inset: 0 auto 0 0; transform: translateX(-100%); transition: transform .2s; }
+    #sidebar.open { transform: none; }
+    #menu { display: block; }
+  }
+</style>
+</head>
+<body>
+<aside id="sidebar">
+  <button id="newChat">+ New chat</button>
+  <div id="chatList"></div>
+  <div id="sideFooter"><div id="modelName">connecting…</div><div id="deviceName"></div></div>
+</aside>
+<div id="main">
+  <div id="topbar">
+    <button id="menu" aria-label="Menu">☰</button>
+    <div id="title">New chat</div>
+    <span class="pill" id="status"></span>
+    <button id="settingsBtn">Settings</button>
+    <button id="themeBtn" aria-label="Toggle theme">◐</button>
+  </div>
+  <div id="settings">
+    <label>System prompt<textarea id="systemPrompt" placeholder="Optional instructions for the assistant"></textarea></label>
+    <label>Max reply tokens<input type="number" id="maxTokens" min="1" step="64" value="1024"></label>
+    <label class="check"><input type="checkbox" id="thinking"> Let the model think first (slower)</label>
+  </div>
+  <div id="messages"></div>
+  <div id="composer">
+    <div id="box">
+      <textarea id="input" rows="1" placeholder="Message your local model…"></textarea>
+      <button id="send" aria-label="Send">↑</button>
+    </div>
+    <div id="hint">Enter to send · Shift+Enter for a new line · greedy decoding (temperature is not used)</div>
+  </div>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(key, fallback) { try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch (e) { return fallback; } },
+  set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {} },
+};
+let chats = store.get("chats", []);
+let currentId = store.get("currentId", null);
+let settings = Object.assign({ systemPrompt: "", maxTokens: 1024, thinking: false }, store.get("settings", {}));
+let abortController = null;
+let generating = false;
+
+const escapeHtml = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// Small Markdown renderer: escapes first, then handles fenced code, headings, lists, bold/italic, inline code and links.
+function inline(text) {
+  const codes = [];
+  text = text.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+  text = escapeHtml(text)
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return text.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${escapeHtml(codes[i])}</code>`);
+}
+function renderMarkdown(src) {
+  const out = [];
+  const lines = src.split("\n");
+  let i = 0, paragraph = [];
+  const flush = () => { if (paragraph.length) { out.push(`<p>${inline(paragraph.join("\n")).replace(/\n/g, "<br>")}</p>`); paragraph = []; } };
+  while (i < lines.length) {
+    const line = lines[i];
+    const fence = line.match(/^```(\w*)/);
+    if (fence) {
+      flush();
+      const body = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith("```")) body.push(lines[i++]);
+      i++;
+      out.push(`<pre><button class="copy" type="button">Copy</button><code>${escapeHtml(body.join("\n"))}</code></pre>`);
+      continue;
+    }
+    const heading = line.match(/^(#{1,3})\s+(.*)/);
+    if (heading) { flush(); out.push(`<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`); i++; continue; }
+    const bullet = line.match(/^\s*[-*]\s+(.*)/), numbered = line.match(/^\s*\d+[.)]\s+(.*)/);
+    if (bullet || numbered) {
+      flush();
+      const tag = bullet ? "ul" : "ol", pattern = bullet ? /^\s*[-*]\s+(.*)/ : /^\s*\d+[.)]\s+(.*)/;
+      const items = [];
+      while (i < lines.length && pattern.test(lines[i])) items.push(`<li>${inline(lines[i++].match(pattern)[1])}</li>`);
+      out.push(`<${tag}>${items.join("")}</${tag}>`);
+      continue;
+    }
+    if (line.trim() === "") { flush(); i++; continue; }
+    paragraph.push(line);
+    i++;
+  }
+  flush();
+  return out.join("");
+}
+// Split a Qwen3 reply into its <think> block and the visible answer (the think block may still be open while streaming).
+function splitThinking(text) {
+  const open = text.indexOf("<think>");
+  if (open === -1) return { think: null, answer: text, done: true };
+  const close = text.indexOf("</think>");
+  if (close === -1) return { think: text.slice(open + 7).trim(), answer: text.slice(0, open), done: false };
+  return { think: text.slice(open + 7, close).trim(), answer: (text.slice(0, open) + text.slice(close + 8)).trim(), done: true };
+}
+function renderAssistant(message, streaming) {
+  const { think, answer, done } = splitThinking(message.content);
+  let html = "";
+  if (think !== null) html += `<details class="think"${done ? "" : " open"}><summary>${done ? "Thought process" : "Thinking…"}</summary><div>${escapeHtml(think)}</div></details>`;
+  html += renderMarkdown(answer);
+  if (message.error) html += `<p class="error">${escapeHtml(message.error)}</p>`;
+  return html;
+}
+
+function save() { store.set("chats", chats); store.set("currentId", currentId); }
+function currentChat() { return chats.find((c) => c.id === currentId) || null; }
+function newChat() {
+  if (generating) return;
+  currentId = null; save(); render(); $("input").focus();
+  $("sidebar").classList.remove("open");
+}
+function renderList() {
+  const list = $("chatList");
+  list.innerHTML = "";
+  for (const chat of chats.slice().reverse()) {
+    const item = document.createElement("div");
+    item.className = "chatItem" + (chat.id === currentId ? " active" : "");
+    item.innerHTML = `<span>${escapeHtml(chat.title)}</span><button type="button" title="Delete">✕</button>`;
+    item.onclick = () => { if (generating) return; currentId = chat.id; save(); render(); $("sidebar").classList.remove("open"); };
+    item.querySelector("button").onclick = (event) => {
+      event.stopPropagation();
+      if (generating) return;
+      chats = chats.filter((c) => c.id !== chat.id);
+      if (currentId === chat.id) currentId = null;
+      save(); render();
+    };
+    list.appendChild(item);
+  }
+}
+function messageRow(message, index, streaming) {
+  const row = document.createElement("div");
+  row.className = "row " + message.role;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble" + (streaming ? " cursor" : "");
+  if (message.role === "user") bubble.textContent = message.content;
+  else bubble.innerHTML = renderAssistant(message, streaming);
+  row.appendChild(bubble);
+  if (message.role === "assistant" && !streaming) {
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const stats = [];
+    if (message.stats && message.stats.completion_tokens) stats.push(`${message.stats.completion_tokens} tokens`);
+    if (message.stats && message.stats.tokens_per_second) stats.push(`${message.stats.tokens_per_second.toFixed(1)} tok/s`);
+    if (message.stats && message.stats.time_to_first_token_s != null) stats.push(`first token ${(message.stats.time_to_first_token_s * 1000).toFixed(0)} ms`);
+    if (stats.length) { const s = document.createElement("span"); s.textContent = stats.join(" · "); meta.appendChild(s); }
+    const copy = document.createElement("button");
+    copy.textContent = "Copy"; copy.type = "button";
+    copy.onclick = () => navigator.clipboard.writeText(splitThinking(message.content).answer).then(() => { copy.textContent = "Copied"; setTimeout(() => copy.textContent = "Copy", 1200); });
+    meta.appendChild(copy);
+    if (index === (currentChat().messages.length - 1)) {
+      const again = document.createElement("button");
+      again.textContent = "Regenerate"; again.type = "button";
+      again.onclick = regenerate;
+      meta.appendChild(again);
+    }
+    row.appendChild(meta);
+  }
+  return row;
+}
+function render() {
+  renderList();
+  const chat = currentChat();
+  $("title").textContent = chat ? chat.title : "New chat";
+  const box = $("messages");
+  box.innerHTML = "";
+  if (!chat || chat.messages.length === 0) {
+    box.innerHTML = '<div id="empty"><h1>What can I help with?</h1><div>Running locally on your own inference engine.</div></div>';
+    return;
+  }
+  chat.messages.forEach((m, i) => box.appendChild(messageRow(m, i, false)));
+  box.scrollTop = box.scrollHeight;
+}
+document.addEventListener("click", (event) => {
+  if (event.target.classList && event.target.classList.contains("copy")) {
+    const code = event.target.parentElement.querySelector("code").textContent;
+    navigator.clipboard.writeText(code).then(() => { event.target.textContent = "Copied"; setTimeout(() => event.target.textContent = "Copy", 1200); });
+  }
+});
+
+function setGenerating(value) {
+  generating = value;
+  const button = $("send");
+  button.classList.toggle("stop", value);
+  button.textContent = value ? "■" : "↑";
+  button.disabled = false;
+  $("status").textContent = value ? "generating…" : "";
+}
+function apiMessages(chat) {
+  const history = chat.messages.filter((m) => !m.error || m.content).map((m) => ({ role: m.role, content: m.role === "assistant" ? splitThinking(m.content).answer : m.content }));
+  return settings.systemPrompt.trim() ? [{ role: "system", content: settings.systemPrompt.trim() }, ...history] : history;
+}
+async function generate(chat) {
+  const reply = { role: "assistant", content: "" };
+  const history = apiMessages(chat);
+  chat.messages.push(reply);
+  save(); render();
+  const box = $("messages");
+  const row = messageRow(reply, chat.messages.length - 1, true);
+  box.replaceChild(row, box.lastChild);
+  const bubble = row.querySelector(".bubble");
+  box.scrollTop = box.scrollHeight;
+  setGenerating(true);
+  abortController = new AbortController();
+  try {
+    const response = await fetch("/v1/chat/completions", {
+      method: "POST", headers: { "Content-Type": "application/json" }, signal: abortController.signal,
+      body: JSON.stringify({ messages: history, stream: true, max_tokens: settings.maxTokens, enable_thinking: settings.thinking }),
+    });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try { detail = (await response.json()).detail || detail; } catch (e) {}
+      throw new Error(detail);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let split;
+      while ((split = buffer.indexOf("\n\n")) !== -1) {
+        const event = buffer.slice(0, split);
+        buffer = buffer.slice(split + 2);
+        if (!event.startsWith("data: ")) continue;
+        const data = event.slice(6);
+        if (data === "[DONE]") continue;
+        const payload = JSON.parse(data);
+        const choice = payload.choices && payload.choices[0];
+        if (choice && choice.delta && choice.delta.content) {
+          reply.content += choice.delta.content;
+          bubble.innerHTML = renderAssistant(reply, true);
+          if (box.scrollHeight - box.scrollTop - box.clientHeight < 120) box.scrollTop = box.scrollHeight;
+        }
+        if (payload.usage) reply.stats = payload.usage;
+      }
+    }
+  } catch (error) {
+    if (error.name !== "AbortError") reply.error = String(error.message || error);
+  } finally {
+    abortController = null;
+    setGenerating(false);
+    if (!reply.content && !reply.error) chat.messages.pop();
+    save(); render();
+  }
+}
+async function send() {
+  if (generating) { if (abortController) abortController.abort(); return; }
+  const text = $("input").value.trim();
+  if (!text) return;
+  let chat = currentChat();
+  if (!chat) {
+    chat = { id: String(Date.now()), title: text.slice(0, 40), messages: [] };
+    chats.push(chat); currentId = chat.id;
+  }
+  chat.messages.push({ role: "user", content: text });
+  $("input").value = ""; autosize();
+  await generate(chat);
+}
+async function regenerate() {
+  const chat = currentChat();
+  if (generating || !chat || chat.messages.length < 2) return;
+  chat.messages.pop();
+  await generate(chat);
+}
+function autosize() { const el = $("input"); el.style.height = "auto"; el.style.height = Math.min(el.scrollHeight, 200) + "px"; }
+
+$("input").addEventListener("input", autosize);
+$("input").addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); send(); } });
+$("send").onclick = send;
+$("newChat").onclick = newChat;
+$("menu").onclick = () => $("sidebar").classList.toggle("open");
+$("settingsBtn").onclick = () => $("settings").classList.toggle("open");
+$("themeBtn").onclick = () => {
+  const dark = document.documentElement.dataset.theme === "dark" || (!document.documentElement.dataset.theme && matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.dataset.theme = dark ? "light" : "dark";
+  store.set("theme", document.documentElement.dataset.theme);
+};
+const savedTheme = store.get("theme", null);
+if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+$("systemPrompt").value = settings.systemPrompt; $("maxTokens").value = settings.maxTokens; $("thinking").checked = settings.thinking;
+const persistSettings = () => {
+  settings = { systemPrompt: $("systemPrompt").value, maxTokens: Math.max(1, parseInt($("maxTokens").value, 10) || 1024), thinking: $("thinking").checked };
+  store.set("settings", settings);
+};
+["systemPrompt", "maxTokens", "thinking"].forEach((id) => $(id).addEventListener("change", persistSettings));
+$("systemPrompt").addEventListener("input", persistSettings);
+
+fetch("/api/info").then((r) => r.json()).then((info) => {
+  $("modelName").textContent = info.model;
+  $("deviceName").textContent = `${info.device} · ${info.max_context} token context`;
+}).catch(() => { $("modelName").textContent = "server unreachable"; });
+render();
+$("input").focus();
+</script>
+</body>
+</html>
