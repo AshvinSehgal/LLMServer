@@ -19,6 +19,10 @@ PROFILE="${PROFILE:-1}"
 ABLATE="${ABLATE:-1}"
 
 ROOT="$PWD"
+# The container runs as a numeric user with no /etc/passwd entry, so getpass.getuser() raises KeyError inside PyTorch's inductor
+# cache setup (vLLM's model inspection died on this); a USER/LOGNAME variable is consulted first.
+export USER="${USER:-condor}" LOGNAME="${LOGNAME:-${USER:-condor}}"
+export TORCHINDUCTOR_CACHE_DIR="$PWD/.inductor_cache" TRITON_CACHE_DIR="$PWD/.triton_cache"
 RESULTS="$ROOT/results"
 mkdir -p "$RESULTS"
 STATUS="$RESULTS/STATUS.txt"
@@ -75,6 +79,13 @@ if [ "${ALLOW_NO_CUDA:-0}" != "1" ] && ! python -c "import torch; assert torch.c
   exit 0
 fi
 
+# Fail fast, with a clear message, if this PyTorch build has no kernels for the GPU the job landed on (for example Blackwell, compute
+# capability 12.0, with torch 2.5.1): every later step would only report "no kernel image is available".
+if [ "${ALLOW_NO_CUDA:-0}" != "1" ] && ! python -c "import torch; (torch.zeros(8, device='cuda') + 1).sum().item()" 2> "$RESULTS/gpu_probe.txt"; then
+  note "FAILED: this PyTorch build cannot run kernels on this GPU (see gpu_probe.txt). The submit files restrict jobs to compute capability 8.0-9.x; resubmit."
+  exit 0
+fi
+
 # vLLM goes in its own virtualenv so its pinned PyTorch cannot disturb the other two libraries.
 # vLLM is pinned to 0.11.0 (built against CUDA 12.8) because the newest wheels link libcudart.so.13, which CUDA 12.x nodes lack; override with VLLM_SPEC.
 # Plain `pip install vllm` can pick a PyTorch build for a newer CUDA than the node's driver supports (CUDA 13 on a CUDA 12.8 driver),
@@ -117,7 +128,7 @@ note "model: $MODEL"
 
 if [ "$RUN_TESTS" = "1" ] && python -c "import pytest" 2>/dev/null; then
   note "running GPU unit tests..."
-  python -m pytest tests/test_paged_decode.py tests/test_fused_ops.py tests/test_joint_qk.py tests/test_quantization.py tests/test_kv_cache.py tests/test_benchmark_cuda.py -v -rs --tb=short -p no:cacheprovider > "$RESULTS/gpu_tests.txt" 2>&1
+  python -m pytest tests/test_paged_decode.py tests/test_architectures.py tests/test_speculative.py tests/test_fused_ops.py tests/test_joint_qk.py tests/test_quantization.py tests/test_kv_cache.py tests/test_benchmark_cuda.py -v -rs --tb=short -p no:cacheprovider > "$RESULTS/gpu_tests.txt" 2>&1
   note "unit tests: $(tail -1 "$RESULTS/gpu_tests.txt")"
   grep -E '^FAILED|^ERROR' "$RESULTS/gpu_tests.txt" | head -20 | tee -a "$STATUS"
   note "skipped tests by reason:"; grep -E '^SKIPPED' "$RESULTS/gpu_tests.txt" | sed 's/^SKIPPED \[[0-9]*\] //' | sort | uniq -c | tee -a "$STATUS"

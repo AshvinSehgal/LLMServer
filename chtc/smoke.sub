@@ -24,7 +24,7 @@ request_memory          = 16GB
 request_disk            = 30GB
 +WantGPULab             = true
 +GPUJobLength           = "short"
-gpus_minimum_capability = 8.0
+require_gpus = (Capability >= 8.0) && (Capability < 10.0)
 gpus_minimum_memory     = 24000
 
 queue

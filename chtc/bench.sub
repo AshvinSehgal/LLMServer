@@ -27,8 +27,8 @@ request_memory          = 32GB
 request_disk            = 50GB
 +WantGPULab             = true
 +GPUJobLength           = "short"
-# bfloat16 and the Triton kernels want compute capability >= 8.0 (A100 / H100); this also keeps results comparable between runs.
-gpus_minimum_capability = 8.0
+# bfloat16 and the Triton kernels want compute capability >= 8.0 (A100 / L40 / H100), and torch 2.5.1 has no kernels for Blackwell (>= 10.0).
+require_gpus = (Capability >= 8.0) && (Capability < 10.0)
 # Qwen3-1.7B at batch 32 x 1024 tokens fits easily in 24 GB.
 gpus_minimum_memory     = 24000
 
