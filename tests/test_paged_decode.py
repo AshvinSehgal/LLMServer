@@ -115,7 +115,7 @@ def tiny_model(seed=0, layers=2):
     reference.generation_config.bos_token_id = 1
     reference.generation_config.pad_token_id = 0
     reference.generation_config.eos_token_id = None
-    with patch("utils.model_loader.AutoModelForCausalLM.from_pretrained", return_value=reference):
+    with patch("utils.model_loader.AutoModelForCausalLM.from_pretrained", return_value=reference), patch("utils.model_loader.CheckpointReader.open", return_value=None):
         return model_loader("tiny-qwen", device=torch.device("cpu"), dtype=torch.float32)
 
 

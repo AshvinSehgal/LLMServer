@@ -49,8 +49,14 @@ class Model(nn.Module):
             DecoderLayer(hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=use_sdpa, decode_attention=decode_attention, qkv_bias=qkv_bias, o_bias=o_bias, mlp_bias=mlp_bias, qk_norm=qk_norm, hidden_act=hidden_act)
             for _ in range(n_hidden_layers)])
         self.norm = RMSNorm(hidden_size, rms_norm_eps)
+        self.embedding_on_cpu = False  # large models keep the embedding table off the GPU
         self.fused_decode_ops = False  # set by the engine when the fused CUDA kernels are usable
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def embed(self, input_ids):
+        if self.embedding_on_cpu:
+            return self.embed_tokens(input_ids.cpu()).to(input_ids.device)
+        return self.embed_tokens(input_ids)
 
     def fuse_projections(self):
         for layer in self.layers:
@@ -63,7 +69,7 @@ class Model(nn.Module):
         input_ids, pos_ids: [rows, 1]; slot_mapping: [rows]; block_tables: [rows, max_blocks]; seq_lens: [rows].
         Returns logits [rows, vocab].
         """
-        hidden_states = self.embed_tokens(input_ids.long())
+        hidden_states = self.embed(input_ids.long())
         cosine, sine = self.rotary_embedding(hidden_states, pos_ids)
         half_dim = sine.shape[-1] // 2
         pos_embeddings = (cosine, sine, torch.cat([-sine[..., :half_dim], sine[..., half_dim:]], dim=-1))
@@ -91,7 +97,7 @@ class Model(nn.Module):
         self.quantize("int8")
 
     def forward(self, input_ids, pos_ids=None, causal_mask=None, kv_cache_manager=None, request_ids=None, block_tables=None, start_pos=None, input_lens=None, logit_rows=None, logit_positions=None, packed=False):
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed(input_ids)
         batch_size, seq_len = input_ids.shape
         if pos_ids is None:
             pos_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.int).unsqueeze(0)

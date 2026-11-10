@@ -45,7 +45,7 @@ def test_int8_linear_handles_all_zero_rows_and_chunked_quantization():
 
 def test_model_loader_quantizes_every_linear_layer_to_int8():
     reference = tiny_reference()
-    with patch("utils.model_loader.AutoModelForCausalLM.from_pretrained", return_value=reference):
+    with patch("utils.model_loader.AutoModelForCausalLM.from_pretrained", return_value=reference), patch("utils.model_loader.CheckpointReader.open", return_value=None):  # exercise the transformers fallback; streaming is covered in test_architectures
         custom = model_loader("tiny-qwen", device=torch.device("cpu"), fuse_projections=False, quantize="int8")
     assert not any(isinstance(module, nn.Linear) for module in custom.modules())
     assert sum(isinstance(module, Int8Linear) for module in custom.modules()) == 2 * 7 + 1  # q, k, v, o, gate, up, down per layer, plus lm_head
@@ -60,7 +60,7 @@ def test_model_loader_quantizes_every_linear_layer_to_int8():
 
 def test_model_loader_quantizes_fused_projections():
     reference = tiny_reference()
-    with patch("utils.model_loader.AutoModelForCausalLM.from_pretrained", return_value=reference):
+    with patch("utils.model_loader.AutoModelForCausalLM.from_pretrained", return_value=reference), patch("utils.model_loader.CheckpointReader.open", return_value=None):  # exercise the transformers fallback; streaming is covered in test_architectures
         custom = model_loader("tiny-qwen", device=torch.device("cpu"), fuse_projections=True, quantize="int8")
     assert all(isinstance(layer.self_attn.qkv_proj, Int8Linear) and isinstance(layer.mlp.gate_up_proj, Int8Linear) for layer in custom.layers)
     assert isinstance(custom.lm_head, Int8Linear)
@@ -150,7 +150,7 @@ def test_int4_falls_back_to_int8_off_mps():
 
 def test_model_loader_fuses_projections_by_default_and_uses_sdpa_prefill():
     reference = tiny_reference()
-    with patch("utils.model_loader.AutoModelForCausalLM.from_pretrained", return_value=reference):
+    with patch("utils.model_loader.AutoModelForCausalLM.from_pretrained", return_value=reference), patch("utils.model_loader.CheckpointReader.open", return_value=None):  # exercise the transformers fallback; streaming is covered in test_architectures
         custom = model_loader("tiny-qwen", device=torch.device("cpu"))
     assert all(layer.self_attn.qkv_proj is not None and layer.mlp.gate_up_proj is not None for layer in custom.layers)
     assert all(layer.self_attn.use_sdpa for layer in custom.layers)

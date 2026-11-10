@@ -73,3 +73,17 @@ def test_unsupported_architectures_fail_with_a_clear_message(name, tmp_path):
     save_random_model(config_factory(), tmp_path)
     with pytest.raises(UnsupportedModelError, match=expected):
         model_loader(str(tmp_path), device=torch.device("cpu"), dtype=torch.float32)
+
+
+@pytest.mark.parametrize("name", ["llama", "llama_tied"])
+def test_cpu_embedding_and_non_streaming_loads_match_huggingface(name, tmp_path, monkeypatch):
+    from utils import model_loader as loader
+    reference = save_random_model(SUPPORTED[name](), tmp_path)
+    ids = torch.randint(0, 128, (1, 9))
+    with torch.no_grad():
+        expected = reference(ids).logits
+        cpu_embedding = loader.model_loader(str(tmp_path), device=torch.device("cpu"), dtype=torch.float32, embedding_on_cpu=True)
+        assert cpu_embedding.embedding_on_cpu and torch.allclose(cpu_embedding(ids), expected, atol=2e-4, rtol=1e-3)
+        monkeypatch.setattr(loader.CheckpointReader, "open", classmethod(lambda cls, model_name: None))  # force the transformers fallback
+        fallback = loader.model_loader(str(tmp_path), device=torch.device("cpu"), dtype=torch.float32)
+        assert torch.allclose(fallback(ids), expected, atol=2e-4, rtol=1e-3)
