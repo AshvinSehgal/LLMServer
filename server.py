@@ -190,11 +190,15 @@ def build_service(args):
     dtype = getattr(torch, args.dtype) if args.dtype else default_dtype(device)
     model = model_loader(args.model, device=device, dtype=dtype, quantize=args.quantize)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    draft_model = None
+    if args.draft_model:
+        print(f"Loading draft model {args.draft_model} ...", flush=True)
+        draft_model = model_loader(args.draft_model, device=device, dtype=dtype, quantize=args.draft_quantize or args.quantize)
     block_size = args.block_size
     blocks_per_sequence = math.ceil(args.max_context / block_size)
     engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=args.max_batch_size,
                     max_num_batched_tokens=args.max_num_batched_tokens, kv_cache_num_blocks=blocks_per_sequence * args.max_batch_size * 2,
-                    kv_cache_block_size=block_size, stream_text=True)
+                    kv_cache_block_size=block_size, stream_text=True, draft_model=draft_model, num_draft_tokens=args.draft_tokens)
     return ChatService(engine, tokenizer, args.model, args.max_context)
 
 
@@ -204,6 +208,9 @@ def parse_args(argv=None):
     parser.add_argument("--device", default=None, help="cuda, mps or cpu (default: best available)")
     parser.add_argument("--dtype", default=None, choices=[None, "float16", "bfloat16", "float32"])
     parser.add_argument("--quantize", default=None, choices=[None, "int8", "int4"])
+    parser.add_argument("--draft-model", default=None, help="small model of the same family for speculative decoding (e.g. Qwen/Qwen3-0.6B for Qwen3-8B); output is unchanged, single conversations decode faster")
+    parser.add_argument("--draft-quantize", default=None, choices=[None, "int8", "int4"], help="defaults to --quantize")
+    parser.add_argument("--draft-tokens", type=int, default=3, help="tokens the draft model proposes per round")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--max-context", type=int, default=4096, help="prompt + reply tokens per conversation")

@@ -18,6 +18,7 @@ from utils.kv_cache import PagedKVCache, KVCacheExhaustedError
 from utils.paged_attention import triton_attention_usable, choose_tile, next_power_of_two, DEFAULT_NUM_SPLITS
 from utils.cuda_graph import CudaGraphDecodeRunner
 from utils.fused_ops import fused_ops_usable
+from utils.speculative import SpeculativeDecoder
 
 STREAM_END = None
 BYTE_LEVEL_DECODER = {character: byte for byte, character in bytes_to_unicode().items()}
@@ -43,7 +44,7 @@ class ByteLevelStreamDecoder:
         return self.utf8_decoder.decode(b"", final=True)
 
 class Engine:
-    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600, prefill_chunk_size=None, kv_cache_num_blocks=500, kv_cache_block_size=500, stream_text=True, prefill_bucketing=True, packed_prefill=True, paged_decode=None, cuda_graphs=None, paged_context_limit=8192, ignore_eos=False):
+    def __init__(self, model, tokenizer, max_new_tokens, max_batch_size, max_num_batched_tokens, max_completed_requests=1000, completed_request_ttl_seconds=3600, prefill_chunk_size=None, kv_cache_num_blocks=500, kv_cache_block_size=500, stream_text=True, prefill_bucketing=True, packed_prefill=True, paged_decode=None, cuda_graphs=None, paged_context_limit=8192, ignore_eos=False, draft_model=None, num_draft_tokens=3):
         self.model = model
         self.tokenizer = tokenizer
         self.device = next(model.parameters()).device
@@ -82,6 +83,7 @@ class Engine:
             dtype=self.dtype
         )
         self.setup_paged_decode(paged_decode, cuda_graphs, paged_context_limit, max_batch_size)
+        self.speculator = SpeculativeDecoder(self, draft_model, num_draft_tokens) if draft_model is not None else None
         if self.model.generation_config.bos_token_id is not None:
             self.bos_token_id = self.model.generation_config.bos_token_id
         elif self.model.config.bos_token_id is not None:
@@ -241,6 +243,8 @@ class Engine:
     
     def release_request_resources(self, request):
         self.kv_cache.free_block_table(request.block_table)
+        if self.speculator is not None:
+            self.speculator.release(request.request_id)
     
     def cancel_request(self, request_id):
         self.prune_completed_requests()
@@ -321,6 +325,16 @@ class Engine:
     def process_decode_batch(self, scheduler_output):
         if not scheduler_output.decode_requests:
             return
+        if self.speculator is not None and len(scheduler_output.decode_requests) == 1:
+            request = scheduler_output.decode_requests[0]
+            tokens = self.speculator.step(request)
+            if tokens is not None:
+                for token_id in tokens:
+                    request.complete_decode()
+                    self.accept_generated_token(request, token_id)
+                    if request.status != RequestStatus.DECODING:
+                        break
+                return
         next_token_ids = self.run_paged_decode(scheduler_output.decode_requests) if self.paged_decode else None
         if next_token_ids is None:
             decode_batch = DecodeBatch(scheduler_output.decode_requests, self.device, self.dtype)
