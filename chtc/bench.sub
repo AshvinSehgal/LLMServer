@@ -27,8 +27,15 @@ request_memory          = 32GB
 request_disk            = 50GB
 +WantGPULab             = true
 +GPUJobLength           = "short"
-# bfloat16 and the Triton kernels want compute capability >= 8.0 (A100 / L40 / H100), and torch 2.5.1 has no kernels for Blackwell (>= 10.0).
-require_gpus = (Capability >= 8.0) && (Capability < 10.0)
+# Benchmark numbers are only comparable between runs on the same GPU model (the same engine decodes 2x faster on an H200 than on an L40),
+# so this file pins one. Uncomment exactly one require_gpus line. A narrower pool can mean a longer wait in the queue; if a job sits idle,
+# run `condor_q -better-analyze <cluster>` and switch to a wider line. The job records the GPU it got in results/environment.txt.
+# torch 2.5.1 has no kernels for Blackwell (compute capability >= 10), so never allow it.
+require_gpus = (Capability == 9.0) && regexp("H200", DeviceName)
+#require_gpus = (Capability == 9.0) && regexp("H100", DeviceName)
+#require_gpus = (Capability == 9.0)
+#require_gpus = (Capability == 8.9)
+#require_gpus = (Capability >= 8.0) && (Capability < 10.0)
 # Qwen3-1.7B at batch 32 x 1024 tokens fits easily in 24 GB.
 gpus_minimum_memory     = 24000
 

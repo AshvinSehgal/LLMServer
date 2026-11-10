@@ -24,6 +24,7 @@ request_memory          = 16GB
 request_disk            = 30GB
 +WantGPULab             = true
 +GPUJobLength           = "short"
+# Correctness only, so any GPU the code supports will do (A100, L40, H100/H200); Blackwell is excluded because torch 2.5.1 has no kernels for it.
 require_gpus = (Capability >= 8.0) && (Capability < 10.0)
 gpus_minimum_memory     = 24000
 
