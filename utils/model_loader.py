@@ -3,6 +3,7 @@ from transformers import AutoModelForCausalLM
 import gc
 from utils.model import Model
 from utils.layers import quantize_linear_layers
+from utils.architecture import describe, UnsupportedModelError
 
 def resolve_decode_attention(device, decode_attention):
     if decode_attention is None:
@@ -11,7 +12,7 @@ def resolve_decode_attention(device, decode_attention):
         raise ValueError(f"Unknown decode attention path: {decode_attention}")
     return decode_attention
 
-def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa=True, decode_attention=None, fuse_projections=True, quantize=None):
+def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa=True, decode_attention=None, fuse_projections=True, quantize=None, allow_unverified=False):
     if quantize not in (None, "int8", "int4"):
         raise ValueError(f"Unknown quantization mode: {quantize}")
     if device is None:
@@ -25,30 +26,15 @@ def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa
     # Load straight into the target dtype: a float32 copy of a 4B model is 16 GB, which exhausts a 16 GB Mac before the engine even starts.
     model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", **({"dtype": dtype} if dtype is not None else {})).eval()
     config = model.config
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    qwen_attention = model.model.layers[0].self_attn
+    model_kwargs, rotary = describe(model, allow_unverified=allow_unverified)
+    head_dim = model_kwargs["head_dim"]
     if dtype is None:
-        dtype = qwen_attention.q_proj.weight.dtype
-    rope_theta = getattr(config, "rope_theta", None)
-    if rope_theta is None:
-        rope_theta = config.rope_parameters["rope_theta"]
+        dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
     with torch.device("meta"):
-        my_model = Model(
-            vocab_size=config.vocab_size,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            n_hidden_layers=config.num_hidden_layers,
-            head_dim=head_dim,
-            rope_theta=rope_theta,
-            n_query_heads=config.num_attention_heads,
-            n_kv_heads=config.num_key_value_heads,
-            bias=qwen_attention.q_proj.bias is not None,
-            attention_scaling=qwen_attention.scaling,
-            rms_norm_eps=config.rms_norm_eps,
-            use_sdpa=use_sdpa,
-            decode_attention=decode_attention,
-        ).eval()
+        my_model = Model(use_sdpa=use_sdpa, decode_attention=decode_attention, **model_kwargs).eval()
     my_model.rotary_embedding.dim_indices = torch.arange(0, head_dim, 2, dtype=torch.long)
+    if rotary is not None:
+        my_model.rotary_embedding.set_inverse_frequencies(*rotary)
     my_model.name = model_name
     reference_state_dict = model.state_dict()
     mapped_state_dict = {key.removeprefix("model."): value for key, value in reference_state_dict.items()}
@@ -59,7 +45,6 @@ def model_loader(model_name="Qwen/Qwen3-1.7B", device=None, dtype=None, use_sdpa
         my_model.lm_head.weight = my_model.embed_tokens.weight
     del mapped_state_dict
     del reference_state_dict
-    del qwen_attention
     del model
     gc.collect()
     # Cast and fuse on the CPU, then move to the device one decoder layer at a time, quantizing each as it arrives. Doing the

@@ -5,12 +5,12 @@ from utils.attention import SelfAttention
 from utils.fused_ops import add_rms_norm, fused_ops_usable
 
 class DecoderLayer(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=False, decode_attention="direct"):
+    def __init__(self, hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=False, decode_attention="direct", qkv_bias=None, o_bias=None, mlp_bias=None, qk_norm=True, hidden_act="silu"):
         super().__init__()
         self.input_layernorm = RMSNorm(hidden_size, rms_norm_eps)
-        self.self_attn = SelfAttention(hidden_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=use_sdpa, decode_attention=decode_attention)
+        self.self_attn = SelfAttention(hidden_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=use_sdpa, decode_attention=decode_attention, qkv_bias=qkv_bias, o_bias=o_bias, qk_norm=qk_norm)
         self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
-        self.mlp = MLP(hidden_size, intermediate_size, bias)
+        self.mlp = MLP(hidden_size, intermediate_size, bias if mlp_bias is None else mlp_bias, hidden_act)
     
     def forward(self, hidden_states, pos_embeddings, causal_mask, kv_cache_manager=None, layer_index=None, request_ids=None, block_tables=None, start_pos=None, input_lens=None, packed=False):
         residual = hidden_states
@@ -41,12 +41,12 @@ class DecoderLayer(nn.Module):
         return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
 class Model(nn.Module):
-    def __init__(self, vocab_size, hidden_size, intermediate_size, n_hidden_layers, head_dim, rope_theta, n_query_heads, n_kv_heads, bias, attention_scaling, rms_norm_eps, use_sdpa=False, decode_attention="direct"):
+    def __init__(self, vocab_size, hidden_size, intermediate_size, n_hidden_layers, head_dim, rope_theta, n_query_heads, n_kv_heads, bias, attention_scaling, rms_norm_eps, use_sdpa=False, decode_attention="direct", qkv_bias=None, o_bias=None, mlp_bias=None, qk_norm=True, hidden_act="silu"):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
         self.rotary_embedding = RotaryEmbedding(head_dim, rope_theta)
         self.layers = nn.ModuleList([
-            DecoderLayer(hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=use_sdpa, decode_attention=decode_attention)
+            DecoderLayer(hidden_size, intermediate_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=use_sdpa, decode_attention=decode_attention, qkv_bias=qkv_bias, o_bias=o_bias, mlp_bias=mlp_bias, qk_norm=qk_norm, hidden_act=hidden_act)
             for _ in range(n_hidden_layers)])
         self.norm = RMSNorm(hidden_size, rms_norm_eps)
         self.fused_decode_ops = False  # set by the engine when the fused CUDA kernels are usable
@@ -68,7 +68,7 @@ class Model(nn.Module):
         half_dim = sine.shape[-1] // 2
         pos_embeddings = (cosine, sine, torch.cat([-sine[..., :half_dim], sine[..., half_dim:]], dim=-1))
         slot_mapping = slot_mapping.long()
-        if self.fused_decode_ops and self.layers[0].mlp.gate_up_proj is not None:
+        if self.fused_decode_ops and self.layers[0].mlp.gate_up_proj is not None and self.layers[0].mlp.hidden_act in ("silu", "swish"):
             # Residual add + RMSNorm and SiLU*up each run as one kernel; the residual stream stays in `hidden_states`.
             eps = self.norm.eps
             hidden_states, normed = add_rms_norm(hidden_states, None, self.layers[0].input_layernorm.weight, eps)

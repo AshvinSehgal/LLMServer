@@ -343,8 +343,15 @@ def test_engine_rejects_missing_bos_and_pad_token_ids():
     model.config.eos_token_id = 2
     with pytest.raises(ValueError):
         Engine(model=model, tokenizer=Tokenizer(bos_token_id=None), max_new_tokens=20, max_batch_size=2, max_num_batched_tokens=20)
-    with pytest.raises(ValueError):
-        Engine(model=model, tokenizer=Tokenizer(bos_token_id=1, pad_token_id=None), max_new_tokens=20, max_batch_size=2, max_num_batched_tokens=20)
+
+def test_engine_falls_back_to_a_valid_pad_token_when_the_model_defines_none():
+    # Llama-style checkpoints have no pad token; padded positions are masked, so the tokenizer's EOS (or 0) is a safe stand-in.
+    model = Model(token_ids_by_call=[], bos_token_id=None, pad_token_id=None)
+    model.config.bos_token_id = None
+    model.config.pad_token_id = None
+    model.config.eos_token_id = 2
+    engine = Engine(model=model, tokenizer=Tokenizer(bos_token_id=1, pad_token_id=None), max_new_tokens=20, max_batch_size=2, max_num_batched_tokens=20)
+    assert isinstance(engine.pad_token_id, int)
 
 def test_empty_engine_step_returns_false():
     engine = Engine(model=Model(token_ids_by_call=[]), tokenizer=Tokenizer(bos_token_id=3), max_new_tokens=20, max_batch_size=2, max_num_batched_tokens=20)

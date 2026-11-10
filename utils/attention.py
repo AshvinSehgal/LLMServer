@@ -4,6 +4,12 @@ import torch.nn.functional as F
 from utils.layers import RMSNorm, apply_rotary_embedding
 from utils.paged_attention import paged_decode_attention, DEFAULT_NUM_SPLITS
 
+def joint_rotary(qk, cosine, signed_sine):
+    """Rotate stacked Q/K heads ([batch, seq, heads, head_dim]) in one pass (models without Q/K normalization)."""
+    half = qk.shape[-1] // 2
+    return torch.addcmul(qk * cosine.unsqueeze(2), torch.cat([qk[..., half:], qk[..., :half]], dim=-1), signed_sine.unsqueeze(2))
+
+
 def joint_qk_norm_rotary(qk, weight, cosine, signed_sine, eps):
     """RMS-normalize and rotate stacked Q/K heads ([batch, seq, heads, head_dim]) in one pass."""
     qk = F.rms_norm(qk, (qk.shape[-1],), None, eps) * weight
@@ -16,18 +22,20 @@ SDPA_SUPPORTS_GQA = tuple(int(part) for part in torch.__version__.split("+")[0].
 
 class SelfAttention(nn.Module):
 
-    def __init__(self, hidden_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=False, decode_attention="direct"):
+    def __init__(self, hidden_size, n_query_heads, n_kv_heads, head_dim, bias, attention_scaling, rms_norm_eps, use_sdpa=False, decode_attention="direct", qkv_bias=None, o_bias=None, qk_norm=True):
         super().__init__()
+        qkv_bias = bias if qkv_bias is None else qkv_bias
+        o_bias = bias if o_bias is None else o_bias
         if decode_attention not in ("direct", "gather_sdpa"):
             raise ValueError(f"Unknown decode attention path: {decode_attention}")
-        self.q_proj = nn.Linear(hidden_size, n_query_heads * head_dim, bias=bias)
-        self.k_proj = nn.Linear(hidden_size, n_kv_heads * head_dim, bias=bias)
-        self.v_proj = nn.Linear(hidden_size, n_kv_heads * head_dim, bias=bias)
+        self.q_proj = nn.Linear(hidden_size, n_query_heads * head_dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(hidden_size, n_kv_heads * head_dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(hidden_size, n_kv_heads * head_dim, bias=qkv_bias)
         self.qkv_proj = None
-        self.o_proj = nn.Linear(n_query_heads * head_dim, hidden_size, bias=bias)
-        self.q_norm = RMSNorm(head_dim, rms_norm_eps)
-        self.k_norm = RMSNorm(head_dim, rms_norm_eps)
-        self.bias = bias
+        self.o_proj = nn.Linear(n_query_heads * head_dim, hidden_size, bias=o_bias)
+        self.q_norm = RMSNorm(head_dim, rms_norm_eps) if qk_norm else None  # Qwen3 normalizes each query/key head; Llama and Qwen2 do not
+        self.k_norm = RMSNorm(head_dim, rms_norm_eps) if qk_norm else None
+        self.bias = qkv_bias
         self.n_query_heads = n_query_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
@@ -116,7 +124,14 @@ class SelfAttention(nn.Module):
             Q = K = None
         V = V.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
         cosine, sine = pos_embeddings[:2]
-        if self.joint_qk_rotary and self.q_norm.use_native and self.k_norm.use_native:
+        if self.q_norm is None:
+            if qk is None:
+                qk = torch.cat([Q.view(batch_size, seq_len, self.n_query_heads, self.head_dim), K.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)], dim=2)
+            signed_sine = pos_embeddings[2] if len(pos_embeddings) > 2 else torch.cat([-sine[..., :self.head_dim // 2], sine[..., self.head_dim // 2:]], dim=-1)
+            qk = joint_rotary(qk, cosine, signed_sine)
+            Q = qk[:, :, :self.n_query_heads].permute(0, 2, 1, 3)
+            K = qk[:, :, self.n_query_heads:].permute(0, 2, 1, 3)
+        elif self.joint_qk_rotary and self.q_norm.use_native and self.k_norm.use_native:
             if qk is None:
                 qk = torch.cat([Q.view(batch_size, seq_len, self.n_query_heads, self.head_dim), K.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)], dim=2)
             signed_sine = pos_embeddings[2] if len(pos_embeddings) > 2 else torch.cat([-sine[..., :self.head_dim // 2], sine[..., self.head_dim // 2:]], dim=-1)

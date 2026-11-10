@@ -148,3 +148,16 @@ python server.py --model Qwen/Qwen3-1.7B --quantize int8 --max-context 8192
 ```
 
 The UI (`web/index.html`, no build step) keeps conversations in the browser, streams tokens, shows tokens/s and time to first token, supports stop, regenerate, a system prompt, and Qwen3's optional thinking mode. Run it with the Python 3.12 environment (torch 2.14, transformers 4.56): under torch 2.11 + transformers 5.5 the output degenerates into repeated `!` and the server prints a warning. The engine decodes greedily, so `temperature`/`top_p` are accepted by the API but ignored. Follow-up messages reuse the KV blocks of earlier turns through the engine's prefix cache. Run `tests/test_server.py` for the API tests (they use a stub engine).
+
+## Supported models
+
+The engine implements one decoder family (pre-norm layers, grouped-query attention, rotary embeddings, gated MLP, RMSNorm) with switches for what differs between models: Q/K normalization, which projections carry biases, the activation, and the rotary frequency schedule (default, linear, Llama-3 and YaRN scaling). `utils/architecture.py` reads these from the Hugging Face model and refuses anything else with a message.
+
+| Verified against Hugging Face logits (`tests/test_architectures.py`) | Notes |
+|---|---|
+| Qwen3 (0.6B, 1.7B, 4B, ...) | Q/K norm |
+| Qwen2 / Qwen2.5 | Q/K/V biases, no Q/K norm |
+| Llama 1/2/3.x, SmolLM | including Llama-3 rope scaling and untied embeddings |
+| Mistral (without sliding window) | |
+
+Not supported: sliding-window attention, attention/logit soft-capping, partial rotary, dynamic or long-context RoPE, fused qkv/gate_up checkpoints (Phi-3) and families with extra norms or embedding scaling (Gemma). Unlisted families are refused unless you pass `allow_unverified=True` to `model_loader`; check their output yourself. Gated models (Llama) need `HF_TOKEN` and an accepted license.

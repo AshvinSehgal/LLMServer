@@ -142,14 +142,22 @@ class RotaryEmbedding(nn.Module):
         dim_indices = torch.arange(0, head_dim, 2, dtype=torch.long)
         self.register_buffer("dim_indices", dim_indices, persistent=False)
         self._inverse_frequencies = None
-    
+        self.attention_factor = 1.0
+
+    def set_inverse_frequencies(self, inverse_frequencies, attention_factor=1.0):
+        """Use precomputed frequencies (Llama-3 / linear / YaRN scaling) instead of the plain theta ** (-2i/d) schedule."""
+        self._inverse_frequencies = inverse_frequencies.detach().to(torch.float32)
+        self.attention_factor = float(attention_factor)
+
     def forward(self, hidden_states, pos_ids):
         if self._inverse_frequencies is None or self._inverse_frequencies.device != pos_ids.device:
-            self._inverse_frequencies = 1.0 / (self.rope_theta ** (self.dim_indices.to(device=pos_ids.device, dtype=torch.float32) / self.head_dim))
+            if self._inverse_frequencies is None:
+                self._inverse_frequencies = 1.0 / (self.rope_theta ** (self.dim_indices.to(device=pos_ids.device, dtype=torch.float32) / self.head_dim))
+            self._inverse_frequencies = self._inverse_frequencies.to(pos_ids.device)
         frequencies = pos_ids.to(torch.float32).unsqueeze(-1) * self._inverse_frequencies.view(1, 1, -1)
         angles = torch.cat([frequencies, frequencies], dim=-1)
-        cosine = torch.cos(angles)
-        sine = torch.sin(angles)
+        cosine = torch.cos(angles) * self.attention_factor
+        sine = torch.sin(angles) * self.attention_factor
         return cosine.to(device=hidden_states.device, dtype=hidden_states.dtype), sine.to(device=hidden_states.device, dtype=hidden_states.dtype)
 
 def rotate_half(hidden_states):
@@ -165,14 +173,20 @@ def apply_rotary_embedding(query, key, cosine, sine):
     rotated_key = key * cosine + rotate_half(key) * sine
     return rotated_query, rotated_key
 
+ACTIVATIONS = {"silu": nn.SiLU, "swish": nn.SiLU, "gelu": nn.GELU, "gelu_pytorch_tanh": lambda: nn.GELU(approximate="tanh"), "gelu_new": lambda: nn.GELU(approximate="tanh"), "relu": nn.ReLU}
+
+
 class MLP(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, bias):
+    def __init__(self, hidden_size, intermediate_size, bias, hidden_act="silu"):
         super().__init__()
+        if hidden_act not in ACTIVATIONS:
+            raise ValueError(f"Unsupported activation {hidden_act!r}; supported: {sorted(ACTIVATIONS)}")
+        self.hidden_act = hidden_act
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
         self.gate_up_proj = None
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
-        self.act_fn = nn.SiLU()
+        self.act_fn = ACTIVATIONS[hidden_act]()
 
     def fuse_projections(self):
         if self.gate_up_proj is not None:
@@ -186,7 +200,7 @@ class MLP(nn.Module):
         self.up_proj = None
     
     def forward_fused(self, hidden_states):
-        """Decode-path MLP with a single SiLU*up kernel (needs fused projections)."""
+        """Decode-path MLP with a single SiLU*up kernel (needs fused projections and a SiLU activation)."""
         from utils.fused_ops import silu_mul
         return self.down_proj(silu_mul(self.gate_up_proj(hidden_states)))
 

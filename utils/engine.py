@@ -97,7 +97,8 @@ class Engine:
         elif self.tokenizer.pad_token_id is not None:
             self.pad_token_id = self.tokenizer.pad_token_id
         else:
-            raise ValueError(f"Model pad_token_id not found: generation_config: {self.model.generation_config.pad_token_id}, config: {self.model.config.pad_token_id}, tokenizer: {self.tokenizer.pad_token_id}")
+            # Llama-style checkpoints define no pad token. Padded positions are masked and never read, so any valid id works.
+            self.pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
         eos_token_ids = self.model.generation_config.eos_token_id
         if eos_token_ids is None:
             eos_token_ids = self.model.config.eos_token_id
@@ -112,12 +113,17 @@ class Engine:
         backend = getattr(self.tokenizer, "backend_tokenizer", None)
         self.byte_level_streaming = backend is not None and type(backend.decoder).__name__ == "ByteLevel" and hasattr(self.tokenizer, "convert_ids_to_tokens")
     
+    def head_dim_is_power_of_two(self):
+        config = self.model.config
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        return head_dim & (head_dim - 1) == 0
+
     def setup_paged_decode(self, paged_decode, cuda_graphs, paged_context_limit, max_batch_size):
         """Decode through on-device block tables (Triton kernel on CUDA, optionally replayed as a CUDA graph).
 
         Contexts longer than paged_context_limit fall back to the gather-based decode path.
         """
-        supported = hasattr(self.model, "forward_decode_paged")
+        supported = hasattr(self.model, "forward_decode_paged") and (self.head_dim_is_power_of_two())
         on_cuda = self.device.type == "cuda"
         self.paged_decode = bool(supported and (paged_decode if paged_decode is not None else on_cuda and triton_attention_usable(self.device)))
         self.graph_runner = None
