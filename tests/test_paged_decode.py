@@ -181,9 +181,10 @@ def test_triton_kernel_matches_reference(n_query_heads, n_kv_heads, head_dim, bl
     query = torch.randn(len(lengths), n_query_heads, head_dim, device="cuda", dtype=dtype)
     scale = head_dim ** -0.5
     expected = dense_reference(query, keys, values, tables, seq_lens, scale)
-    for num_splits in (1, 4, 32):
-        actual = pa.paged_decode_attention_triton(query, keys, values, tables, seq_lens, scale, num_splits=num_splits)
-        torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+    for variant in ("dot", "broadcast"):
+        for num_splits in (1, 4, 32):
+            actual = pa.paged_decode_attention_triton(query, keys, values, tables, seq_lens, scale, num_splits=num_splits, variant=variant)
+            torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
 
 
 @triton_only

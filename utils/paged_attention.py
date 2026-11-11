@@ -148,6 +148,58 @@ if TRITON_AVAILABLE:
         tl.store(partial_sum_ptr + slot, l_i, mask=row_mask)
 
     @triton.jit
+    def _paged_decode_partial_dot_kernel(
+        q_ptr, k_ptr, v_ptr, block_tables_ptr, seq_lens_ptr,
+        partial_acc_ptr, partial_max_ptr, partial_sum_ptr,
+        scale,
+        stride_qb, stride_qh,
+        stride_kb, stride_kt, stride_kh,
+        stride_bt,
+        BLOCK_SIZE: tl.constexpr, HEAD_DIM: tl.constexpr,
+        NUM_Q_HEADS: tl.constexpr, GROUP: tl.constexpr, GROUP_PAD: tl.constexpr,
+        TILE: tl.constexpr, TOKENS_PER_SPLIT: tl.constexpr, NUM_SPLITS: tl.constexpr,
+    ):
+        """Same split-KV algorithm as _paged_decode_partial_kernel, but Q.K^T and P.V are tl.dot (tensor cores) on the
+        cache's native dtype instead of fp32 broadcast-multiply-reduce, which spills registers at head_dim 128. The group
+        of query heads is padded to the 16 rows tl.dot needs; decode is memory bound so the wasted rows are free."""
+        b = tl.program_id(0)
+        kv_head = tl.program_id(1)
+        split = tl.program_id(2)
+        seq_len = tl.load(seq_lens_ptr + b)
+        start = split * TOKENS_PER_SPLIT
+        end = tl.minimum(start + TOKENS_PER_SPLIT, seq_len)
+
+        rows = tl.arange(0, GROUP_PAD)
+        row_mask = rows < GROUP
+        q_head = kv_head * GROUP + rows
+        d = tl.arange(0, HEAD_DIM)
+        q = tl.load(q_ptr + b * stride_qb + q_head[:, None] * stride_qh + d[None, :], mask=row_mask[:, None], other=0.0)
+
+        m_i = tl.full([GROUP_PAD], float("-inf"), tl.float32)
+        l_i = tl.zeros([GROUP_PAD], tl.float32)
+        acc = tl.zeros([GROUP_PAD, HEAD_DIM], tl.float32)
+        for t0 in range(start, end, TILE):
+            tok = t0 + tl.arange(0, TILE)
+            valid = tok < end
+            physical = tl.load(block_tables_ptr + b * stride_bt + tok // BLOCK_SIZE, mask=valid, other=0).to(tl.int64)
+            kv_offset = physical * stride_kb + (tok % BLOCK_SIZE) * stride_kt + kv_head * stride_kh
+            k = tl.load(k_ptr + kv_offset[:, None] + d[None, :], mask=valid[:, None], other=0.0)
+            scores = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
+            scores = tl.where(valid[None, :], scores, float("-inf"))
+            m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            v = tl.load(v_ptr + kv_offset[:, None] + d[None, :], mask=valid[:, None], other=0.0)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision="ieee")
+            m_i = m_new
+
+        slot = (b * NUM_Q_HEADS + q_head) * NUM_SPLITS + split
+        tl.store(partial_acc_ptr + slot[:, None] * HEAD_DIM + d[None, :], acc, mask=row_mask[:, None])
+        tl.store(partial_max_ptr + slot, m_i, mask=row_mask)
+        tl.store(partial_sum_ptr + slot, l_i, mask=row_mask)
+
+    @triton.jit
     def _paged_decode_reduce_kernel(
         partial_acc_ptr, partial_max_ptr, partial_sum_ptr, out_ptr,
         stride_ob, stride_oh,
@@ -167,7 +219,17 @@ if TRITON_AVAILABLE:
         tl.store(out_ptr + b * stride_ob + h * stride_oh + d, out.to(out_ptr.dtype.element_ty))
 
 
-def paged_decode_attention_triton(query, key_cache, value_cache, block_tables, seq_lens, scale, num_splits=DEFAULT_NUM_SPLITS, tokens_per_split=None):
+DOT_TILE = 64
+DOT_MIN_GROUP_ROWS = 16
+
+
+def attention_kernel_variant():
+    """"dot" (tensor-core kernel, default) or "broadcast" (fp32 broadcast-reduce kernel); LLMSERVER_ATTENTION_KERNEL overrides."""
+    return os.environ.get("LLMSERVER_ATTENTION_KERNEL", "dot")
+
+
+def paged_decode_attention_triton(query, key_cache, value_cache, block_tables, seq_lens, scale, num_splits=DEFAULT_NUM_SPLITS, tokens_per_split=None,
+                                  variant=None, tile=None, num_warps=4, num_stages=None):
     batch, n_query_heads, head_dim = query.shape
     num_blocks, block_size, n_kv_heads, _ = key_cache.shape
     if key_cache.stride() != value_cache.stride():
@@ -177,15 +239,23 @@ def paged_decode_attention_triton(query, key_cache, value_cache, block_tables, s
     if head_dim & (head_dim - 1) or num_splits & (num_splits - 1):
         raise ValueError(f"head_dim and num_splits must be powers of two: {head_dim}, {num_splits}")
     group = n_query_heads // n_kv_heads
-    group_pad = max(2, next_power_of_two(group))
-    tile = choose_tile(group_pad)
+    variant = variant or attention_kernel_variant()
+    if variant == "dot":
+        group_pad = max(DOT_MIN_GROUP_ROWS, next_power_of_two(group))
+        tile = tile or DOT_TILE
+        partial_kernel = _paged_decode_partial_dot_kernel
+    else:
+        group_pad = max(2, next_power_of_two(group))
+        tile = tile or choose_tile(group_pad)
+        partial_kernel = _paged_decode_partial_kernel
     if tokens_per_split is None:
         tokens_per_split = default_tokens_per_split(num_blocks, block_size, num_splits, tile)
     partial_acc = torch.empty(batch, n_query_heads, num_splits, head_dim, device=query.device, dtype=torch.float32)
     partial_max = torch.empty(batch, n_query_heads, num_splits, device=query.device, dtype=torch.float32)
     partial_sum = torch.empty_like(partial_max)
     output = torch.empty_like(query)
-    _paged_decode_partial_kernel[(batch, n_kv_heads, num_splits)](
+    launch_options = {} if num_stages is None else {"num_stages": num_stages}
+    partial_kernel[(batch, n_kv_heads, num_splits)](
         query, key_cache, value_cache, block_tables, seq_lens,
         partial_acc, partial_max, partial_sum,
         scale,
@@ -194,7 +264,7 @@ def paged_decode_attention_triton(query, key_cache, value_cache, block_tables, s
         block_tables.stride(0),
         BLOCK_SIZE=block_size, HEAD_DIM=head_dim, NUM_Q_HEADS=n_query_heads, GROUP=group, GROUP_PAD=group_pad,
         TILE=tile, TOKENS_PER_SPLIT=tokens_per_split, NUM_SPLITS=num_splits,
-        num_warps=4,
+        num_warps=num_warps, **launch_options,
     )
     _paged_decode_reduce_kernel[(batch, n_query_heads)](
         partial_acc, partial_max, partial_sum, output,
