@@ -278,34 +278,62 @@ def profile_custom(backend, tokenizer, args, torch):
 
 
 def profile_prefill(backend, tokenizer, args, torch):
-    """Kernel-level profile of prefill (time to first token) for the shapes where the engine trails vLLM."""
+    """Where time-to-first-token goes for the shapes where the engine trails vLLM: phase timings, how the scheduler batched the
+    prompts, and a kernel table for one prefill."""
     from torch.profiler import profile, ProfilerActivity
     engine = backend.engine
     lines = []
     for prompt_length, batch in ((min(parse_ints(args.prompt_tokens)), max(parse_ints(args.batch_sizes))), (max(parse_ints(args.prompt_tokens)), 8)):
         engine.max_new_tokens = 1
+        batches = []
+        original = engine.process_prefill_work
 
-        def prefill_once(tag, record):
+        def traced(prefill_work, packed=False, _original=original, _log=batches):
+            _log.append((len(prefill_work), sorted({chunk for _, chunk in prefill_work}), sorted({request.num_computed_tokens for request, _ in prefill_work}), packed))
+            return _original(prefill_work, packed=packed)
+
+        engine.process_prefill_work = traced
+
+        def prefill_once(tag):
             prompts = build_prompts(tokenizer, prompt_length, batch, tag)
+            sync(torch)
+            t0 = time.perf_counter()
             requests = [engine.add_request(None, prompt_token_ids=prompt) for prompt in prompts]
-            sync(torch)
-            start = time.perf_counter()
+            t1 = time.perf_counter()
             steps = 0
-            while engine.step():
+            while True:
+                more = engine.step()
                 steps += 1
+                if not more:
+                    break
             sync(torch)
-            return time.perf_counter() - start, steps
+            t2 = time.perf_counter()
+            return t1 - t0, t2 - t1, steps
 
         try:
-            prefill_once("pw", False)
-            seconds, steps = prefill_once("pt", False)
+            prefill_once("pw")
+            batches.clear()
+            add_s, step_s, steps = prefill_once("pt")
+            traced_batches = list(batches)
             with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-                prefill_once("pp", True)
+                prefill_once("pp")
                 sync(torch)
+            benchmark_style = []
+            for repeat in range(3):
+                prompts = build_prompts(tokenizer, prompt_length, batch, f"pb-{repeat}")
+                sync(torch)
+                t0 = time.perf_counter()
+                backend.run(prompts, 1)
+                sync(torch)
+                benchmark_style.append(time.perf_counter() - t0)
         except Exception as failure:
-            lines.append(f"===== prefill prompt={prompt_length} batch={batch} failed: {failure} =====")
+            lines.append(f"===== prefill prompt={prompt_length} batch={batch} failed: {type(failure).__name__}: {failure} =====")
             continue
-        lines.append(f"===== PREFILL prompt={prompt_length} batch={batch}: {seconds * 1000:.1f} ms in {steps} engine steps (max_num_batched_tokens={engine.max_num_batched_tokens}) =====")
+        finally:
+            engine.process_prefill_work = original
+        lines.append(f"===== PREFILL prompt={prompt_length} batch={batch}: add_request x{batch} {add_s * 1000:.1f} ms + {steps} engine steps {step_s * 1000:.1f} ms; "
+                     f"benchmark-style backend.run {[round(t * 1000, 1) for t in benchmark_style]} ms =====")
+        lines.append(f"prefill forward passes (requests, chunk lengths, start positions, packed): {traced_batches}")
         lines.append(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25, max_name_column_width=70))
     return lines
 
