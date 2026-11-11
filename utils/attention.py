@@ -222,6 +222,13 @@ class SelfAttention(nn.Module):
                 else:
                     cached_keys, cached_values, attention_mask = kv_cache.get_batch_ragged(layer_index, block_tables, end_positions)
                 attention_scores = self.grouped_sdpa_read(Q, cached_keys, cached_values, group_size, attention_mask)
+            elif (batch_size > 1 and seq_len > 1 and self.use_sdpa and SDPA_SUPPORTS_GQA and getattr(kv_cache, "batched_prefill", False)
+                  and not any(start_pos) and max(input_lens) == seq_len and min(input_lens) >= 1):
+                # First chunk of every request, right-padded: one cache scatter and one causal GQA attention call for the whole
+                # batch instead of two launches per request. Padded rows are computed but never read (causal attention keeps
+                # real tokens independent of the padding after them).
+                kv_cache.append_batch(layer_index, block_tables, input_lens, K, V)
+                attention_scores = F.scaled_dot_product_attention(Q, K, V, dropout_p=0.0, scale=self.attention_scaling, is_causal=True, enable_gqa=True)
             else:
                 direct_output = batch_size == 1 and input_lens[0] == seq_len
                 attention_scores = None if direct_output else torch.zeros_like(Q)

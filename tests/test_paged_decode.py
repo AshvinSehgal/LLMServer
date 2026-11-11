@@ -242,3 +242,31 @@ def test_engine_accepts_token_ids_and_can_ignore_eos():
     assert ignored.generated_token_ids == request.generated_token_ids
     with pytest.raises(ValueError):
         plain.add_request(None, prompt_token_ids=[])
+
+
+def test_batched_prefill_matches_per_request_prefill():
+    """One scatter + one causal attention call for a right-padded batch must equal the per-request loop (outputs and cache)."""
+    from utils.model import Model
+    from utils.kv_cache import PagedKVCache
+    torch.manual_seed(0)
+    model = Model(vocab_size=50, hidden_size=32, intermediate_size=64, n_hidden_layers=2, head_dim=16, rope_theta=10000.0, n_query_heads=4, n_kv_heads=2, bias=False,
+                  attention_scaling=16 ** -0.5, rms_norm_eps=1e-6, use_sdpa=True).eval()
+    for parameter in model.parameters():
+        torch.nn.init.normal_(parameter, std=0.2)
+    lengths = [5, 9, 9, 1]
+    padded = max(lengths)
+    ids = torch.randint(0, 50, (len(lengths), padded))
+    outputs, caches = [], []
+    for batched in (False, True):
+        cache = PagedKVCache(num_layers=2, num_blocks=20, block_size=4, num_kv_heads=2, head_dim=16, device="cpu", dtype=torch.float32)
+        cache.vectorized_prefill_write = True
+        cache.batched_prefill = batched
+        tables = [[] for _ in lengths]
+        with torch.no_grad():
+            hidden = model(ids, kv_cache_manager=cache, request_ids=list(range(4)), block_tables=tables, start_pos=[0] * 4, input_lens=lengths,
+                           logit_rows=torch.arange(4), logit_positions=torch.tensor([length - 1 for length in lengths]))
+        outputs.append(hidden)
+        caches.append((cache.key_cache.clone(), cache.value_cache.clone(), [list(table) for table in tables]))
+    assert caches[0][2] == caches[1][2]
+    assert torch.allclose(outputs[0], outputs[1], atol=1e-5)
+    assert torch.allclose(caches[0][0], caches[1][0], atol=1e-5) and torch.allclose(caches[0][1], caches[1][1], atol=1e-5)

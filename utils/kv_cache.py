@@ -88,6 +88,7 @@ class PagedKVCache:
         self.key_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
         self.value_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
         self.vectorized_prefill_write = torch.device(device).type == "cuda"
+        self.batched_prefill = self.vectorized_prefill_write  # one scatter + one attention call for a whole prefill batch
         self.slot_memo = {}
         self.free_blocks = deque(range(self.num_blocks))
         self.block_references = [0] * self.num_blocks
@@ -274,6 +275,41 @@ class PagedKVCache:
             slots = torch.from_numpy(blocks * self.block_size + positions % self.block_size).to(self.key_cache.device)
             self.slot_memo[key] = slots
         return slots
+
+    def batch_prefill_layout(self, block_tables, lengths, padded_length):
+        """(slots, valid_rows) for writing a right-padded batch of first-chunk prompts in one scatter.
+
+        slots: flat cache slots of every real token, request by request; valid_rows: indices of those tokens in the
+        [batch * padded_length] flattened activations, or None when nothing is padded. Memoized like prefill_slots.
+        """
+        for table, length in zip(block_tables, lengths):
+            if len(table) * self.block_size < length:
+                self.prefill_slots(table, 0, length)  # allocates blocks the same way the per-request path does
+        key = ("batch", tuple((tuple(table), length) for table, length in zip(block_tables, lengths)), padded_length)
+        layout = self.slot_memo.get(key)
+        if layout is None:
+            device = self.key_cache.device
+            slots = torch.cat([self.prefill_slots(table, 0, length) for table, length in zip(block_tables, lengths)])
+            valid_rows = None
+            if any(length != padded_length for length in lengths):
+                valid_rows = torch.cat([torch.arange(row * padded_length, row * padded_length + length) for row, length in enumerate(lengths)]).to(device)
+            layout = (slots, valid_rows)
+            if len(self.slot_memo) >= 256:
+                self.slot_memo.clear()
+            self.slot_memo[key] = layout
+        return layout
+
+    def append_batch(self, layer_index, block_tables, lengths, keys, values):
+        """Write the first chunk of several requests at once. keys/values: [batch, kv_heads, padded_length, head_dim]."""
+        batch, _, padded_length, _ = keys.shape
+        slots, valid_rows = self.batch_prefill_layout(block_tables, lengths, padded_length)
+        flat_keys = keys.permute(0, 2, 1, 3).reshape(batch * padded_length, self.num_kv_heads, self.head_dim)
+        flat_values = values.permute(0, 2, 1, 3).reshape(batch * padded_length, self.num_kv_heads, self.head_dim)
+        if valid_rows is not None:
+            flat_keys = flat_keys.index_select(0, valid_rows)
+            flat_values = flat_values.index_select(0, valid_rows)
+        self.key_cache[layer_index].view(-1, self.num_kv_heads, self.head_dim).index_copy_(0, slots, flat_keys)
+        self.value_cache[layer_index].view(-1, self.num_kv_heads, self.head_dim).index_copy_(0, slots, flat_values)
 
     def slot_for(self, block_table, token_pos):
         """Flat cache slot (block * block_size + offset) for a token, allocating its block if needed."""
