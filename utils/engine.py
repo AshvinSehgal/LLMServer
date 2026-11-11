@@ -23,7 +23,7 @@ from utils.speculative import SpeculativeDecoder
 STREAM_END = None
 BYTE_LEVEL_DECODER = {character: byte for byte, character in bytes_to_unicode().items()}
 MAX_PACKED_PREFILL_TOKENS = 512
-MIN_TOKENS_PER_SPLIT = 128
+MIN_TOKENS_PER_SPLIT = 256  # H200 sweep (bench_attention.py): 256-token slices were fastest at batch >= 8, within 2% of the best at batch 1
 MAX_SPLITS = 64
 
 class ByteLevelStreamDecoder:

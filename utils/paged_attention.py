@@ -240,6 +240,8 @@ def paged_decode_attention_triton(query, key_cache, value_cache, block_tables, s
         raise ValueError(f"head_dim and num_splits must be powers of two: {head_dim}, {num_splits}")
     group = n_query_heads // n_kv_heads
     variant = variant or attention_kernel_variant()
+    if head_dim < 16:
+        variant = "broadcast"  # tl.dot needs every dimension >= 16
     if variant == "dot":
         group_pad = max(DOT_MIN_GROUP_ROWS, next_power_of_two(group))
         tile = tile or DOT_TILE
