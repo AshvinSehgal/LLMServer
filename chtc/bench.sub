@@ -12,7 +12,7 @@ arguments               = --prompt-tokens 128,1024 --batch-sizes 1,8,32 --output
 environment             = "MODEL_ID=Qwen/Qwen3-1.7B BACKENDS=hf,custom,vllm RUN_TESTS=1 PROFILE=1 ABLATE=1"
 
 # the source directories are copied into the job's top-level directory
-transfer_input_files    = utils, tests, benchmark.py, benchmark_cuda.py
+transfer_input_files    = utils, tests, benchmark.py, benchmark_cuda.py, agreement_check.py
 should_transfer_files   = YES
 when_to_transfer_output = ON_EXIT
 transfer_output_files   = llmserver_results.tar.gz
