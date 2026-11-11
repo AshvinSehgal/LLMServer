@@ -272,8 +272,42 @@ def profile_custom(backend, tokenizer, args, torch):
             for request in requests:
                 engine.cancel_request(request.request_id)
             engine.graph_runner = runner
+    lines += profile_prefill(backend, tokenizer, args, torch)
     with open(args.profile_out, "w") as handle:
         handle.write("\n".join(lines))
+
+
+def profile_prefill(backend, tokenizer, args, torch):
+    """Kernel-level profile of prefill (time to first token) for the shapes where the engine trails vLLM."""
+    from torch.profiler import profile, ProfilerActivity
+    engine = backend.engine
+    lines = []
+    for prompt_length, batch in ((min(parse_ints(args.prompt_tokens)), max(parse_ints(args.batch_sizes))), (max(parse_ints(args.prompt_tokens)), 8)):
+        engine.max_new_tokens = 1
+
+        def prefill_once(tag, record):
+            prompts = build_prompts(tokenizer, prompt_length, batch, tag)
+            requests = [engine.add_request(None, prompt_token_ids=prompt) for prompt in prompts]
+            sync(torch)
+            start = time.perf_counter()
+            steps = 0
+            while engine.step():
+                steps += 1
+            sync(torch)
+            return time.perf_counter() - start, steps
+
+        try:
+            prefill_once("pw", False)
+            seconds, steps = prefill_once("pt", False)
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                prefill_once("pp", True)
+                sync(torch)
+        except Exception as failure:
+            lines.append(f"===== prefill prompt={prompt_length} batch={batch} failed: {failure} =====")
+            continue
+        lines.append(f"===== PREFILL prompt={prompt_length} batch={batch}: {seconds * 1000:.1f} ms in {steps} engine steps (max_num_batched_tokens={engine.max_num_batched_tokens}) =====")
+        lines.append(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25, max_name_column_width=70))
+    return lines
 
 
 def compare_tokens(reference, other):
