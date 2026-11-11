@@ -117,19 +117,33 @@ class Model(nn.Module):
         if causal_mask is None and (kv_cache_manager is None or seq_len > 1):
             mask_value = torch.finfo(hidden_states.dtype).min
             causal_mask = torch.full((batch_size, 1, seq_len, seq_len), mask_value, device=hidden_states.device, dtype=hidden_states.dtype).triu(diagonal=1)
-        for layer_index, layer in enumerate(self.layers):
-            hidden_states = layer(
-                hidden_states, 
-                pos_embeddings, 
-                causal_mask,
-                kv_cache_manager=kv_cache_manager,
-                layer_index=layer_index,
-                request_ids=request_ids,
-                block_tables=block_tables,
-                start_pos=start_pos,
-                input_lens=input_lens,
-                packed=packed
-                )
+        if self.fused_decode_ops and self.layers[0].mlp.gate_up_proj is not None and self.layers[0].mlp.hidden_act in ("silu", "swish"):
+            # Same fused residual-add + RMSNorm and SiLU*up dataflow as decode: replaces pow/mean/rsqrt/mul/add launches that cost as much as the attention at batch >= 8.
+            eps = self.norm.eps
+            hidden_states, normed = add_rms_norm(hidden_states, None, self.layers[0].input_layernorm.weight, eps)
+            for layer_index, layer in enumerate(self.layers):
+                attention_output = layer.self_attn(normed, pos_embeddings, causal_mask, kv_cache=kv_cache_manager, layer_index=layer_index, request_ids=request_ids,
+                                                   block_tables=block_tables, start_pos=start_pos, input_lens=input_lens, packed=packed)
+                hidden_states, normed = add_rms_norm(hidden_states, attention_output, layer.post_attention_layernorm.weight, eps)
+                mlp_output = layer.mlp.forward_fused(normed)
+                if layer_index + 1 < len(self.layers):
+                    hidden_states, normed = add_rms_norm(hidden_states, mlp_output, self.layers[layer_index + 1].input_layernorm.weight, eps)
+                else:
+                    hidden_states = hidden_states + mlp_output
+        else:
+            for layer_index, layer in enumerate(self.layers):
+                hidden_states = layer(
+                    hidden_states,
+                    pos_embeddings,
+                    causal_mask,
+                    kv_cache_manager=kv_cache_manager,
+                    layer_index=layer_index,
+                    request_ids=request_ids,
+                    block_tables=block_tables,
+                    start_pos=start_pos,
+                    input_lens=input_lens,
+                    packed=packed
+                    )
         if logit_rows is not None:
             if logit_positions is None:
                 raise ValueError("logit_positions are required when logit_rows are provided")

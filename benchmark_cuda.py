@@ -116,10 +116,19 @@ class CustomBackend:
                              kv_cache_num_blocks=wanted, kv_cache_block_size=block_size, stream_text=False, max_completed_requests=0,
                              ignore_eos=True, paged_context_limit=max(8192, max_length), **options)
         self.capacity_tokens = wanted * block_size
+        self.prefill_trace = []
+        original = self.engine.process_prefill_work
+
+        def traced(prefill_work, packed=False):
+            self.prefill_trace.append((len(prefill_work), sorted({chunk for _, chunk in prefill_work}), sorted({request.num_computed_tokens for request, _ in prefill_work}), packed))
+            return original(prefill_work, packed=packed)
+
+        self.engine.process_prefill_work = traced
 
     def run(self, prompts, new_tokens):
         engine = self.engine
         engine.max_new_tokens = new_tokens
+        self.prefill_trace.clear()
         if sum(len(prompt) + new_tokens for prompt in prompts) > self.capacity_tokens:
             raise MemoryError("KV cache too small for this configuration")
         requests = [engine.add_request(None, prompt_token_ids=prompt) for prompt in prompts]
@@ -205,6 +214,8 @@ def run_backend(args):
                         backend.run(prompts, 1)
                         sync(torch)
                         ttft.append(time.perf_counter() - start)
+                        if repeat == 0 and getattr(backend, "prefill_trace", None) is not None:
+                            entry["prefill_batches"] = list(backend.prefill_trace)  # (requests, chunk lengths, start positions, packed) per forward pass
                     for repeat in range(args.repeats):
                         prompts = build_prompts(tokenizer, prompt_length, batch, f"tn-{repeat}")
                         sync(torch)

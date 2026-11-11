@@ -122,3 +122,62 @@ def test_qkv_write_kernel_matches_reference(dtype, qk_norm):
     assert torch.allclose(got.float(), expected.float(), atol=tolerance)
     assert torch.allclose(cache.key_cache.float(), expected_keys.float(), atol=tolerance)
     assert torch.equal(cache.value_cache, expected_values)
+
+
+def test_fused_prefill_dataflow_matches_unfused_model():
+    """Model.forward with the fused residual/norm/SiLU dataflow must equal the layer-by-layer path (here through the reference fallbacks)."""
+    from utils.model import Model
+    from utils.kv_cache import PagedKVCache
+    torch.manual_seed(0)
+    model = Model(vocab_size=50, hidden_size=32, intermediate_size=64, n_hidden_layers=3, head_dim=8, rope_theta=10000.0, n_query_heads=4, n_kv_heads=2, bias=False,
+                  attention_scaling=8 ** -0.5, rms_norm_eps=1e-6, use_sdpa=True).eval()
+    for parameter in model.parameters():
+        torch.nn.init.normal_(parameter, std=0.2)
+    model.fuse_projections()
+    ids = torch.randint(0, 50, (3, 6))
+    lengths = [6, 4, 6]
+    outputs = []
+    for fused in (False, True):
+        model.fused_decode_ops = fused
+        cache = PagedKVCache(num_layers=3, num_blocks=20, block_size=4, num_kv_heads=2, head_dim=8, device="cpu", dtype=torch.float32)
+        tables = [[] for _ in lengths]
+        with torch.no_grad():
+            outputs.append(model(ids, kv_cache_manager=cache, request_ids=[0, 1, 2], block_tables=tables, start_pos=[0, 0, 0], input_lens=lengths,
+                                 logit_rows=torch.arange(3), logit_positions=torch.tensor([5, 3, 5])))
+    assert torch.allclose(outputs[0], outputs[1], atol=1e-5)
+
+
+@pytest.mark.parametrize("qk_norm", [True, False])
+def test_qk_norm_rotary_reference_matches_project_qkv(qk_norm):
+    from utils.fused_ops import qk_norm_rotary_reference
+    attention, hidden, pos, cache, slots = _qkv_case(torch.float32, qk_norm)
+    hidden = torch.randn(3, 5, 32)
+    angle = torch.rand(3, 5, 8)
+    cosine = torch.cat([angle.cos()] * 2, dim=-1)
+    sine = torch.cat([angle.sin()] * 2, dim=-1)
+    signed = torch.cat([-sine[..., :8], sine[..., 8:]], dim=-1)
+    with torch.no_grad():
+        Q, K, V = attention.project_qkv(hidden, (cosine, sine, signed))
+        qkv = attention.qkv_proj(hidden)
+        weight = attention.qk_norm_weight(qkv) if qk_norm else None
+        qk = qk_norm_rotary_reference(qkv, weight, cosine, signed, 4, 2, 16, 1e-6)
+    assert torch.allclose(qk[:, :, :4].permute(0, 2, 1, 3), Q, atol=1e-6) and torch.allclose(qk[:, :, 4:].permute(0, 2, 1, 3), K, atol=1e-6)
+
+
+@cuda_only
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("qk_norm", [True, False])
+def test_qk_norm_rotary_kernel_matches_reference(dtype, qk_norm):
+    from utils.fused_ops import qk_norm_rotary, qk_norm_rotary_reference
+    attention, _, _, _, _ = _qkv_case(dtype, qk_norm, device="cuda")
+    hidden = torch.randn(3, 5, 32, device="cuda", dtype=dtype)
+    angle = torch.rand(3, 5, 8, device="cuda")
+    cosine = torch.cat([angle.cos()] * 2, dim=-1).to(dtype)
+    sine = torch.cat([angle.sin()] * 2, dim=-1).to(dtype)
+    signed = torch.cat([-sine[..., :8], sine[..., 8:]], dim=-1)
+    with torch.no_grad():
+        qkv = attention.qkv_proj(hidden)
+        weight = attention.qk_norm_weight(qkv) if qk_norm else None
+        expected = qk_norm_rotary_reference(qkv, weight, cosine, signed, 4, 2, 16, 1e-6)
+        got = qk_norm_rotary(qkv, weight, cosine, signed, 4, 2, 16, 1e-6)
+    assert torch.allclose(got.float(), expected.float(), atol=1e-2 if dtype == torch.bfloat16 else 2e-3)

@@ -45,6 +45,17 @@ def qkv_norm_rotary_write_reference(qkv, norm_weight, cosine, signed_sine, slot_
     return qk[:, 0, :n_query_heads]
 
 
+def qk_norm_rotary_reference(qkv, norm_weight, cosine, signed_sine, n_query_heads, n_kv_heads, head_dim, eps):
+    """Q/K RMSNorm (optional) + rotary for a [batch, seq, (n_query_heads + 2 * n_kv_heads) * head_dim] projection; returns [batch, seq, n_query_heads + n_kv_heads, head_dim]."""
+    batch, seq = qkv.shape[:2]
+    n_qk = n_query_heads + n_kv_heads
+    qk = qkv[..., :n_qk * head_dim].reshape(batch, seq, n_qk, head_dim)
+    if norm_weight is not None:
+        qk = F.rms_norm(qk, (head_dim,), None, eps) * norm_weight
+    half = head_dim // 2
+    return torch.addcmul(qk * cosine.unsqueeze(2), torch.cat([qk[..., half:], qk[..., :half]], dim=-1), signed_sine.unsqueeze(2))
+
+
 def silu_mul_reference(gate_up):
     gate, up = gate_up.chunk(2, dim=-1)
     return F.silu(gate) * up
@@ -78,7 +89,7 @@ if TRITON_AVAILABLE:
 
     @triton.jit
     def _qkv_norm_rotary_write_kernel(qkv_ptr, weight_ptr, cos_ptr, sin_ptr, slot_ptr, q_ptr, key_cache_ptr, value_cache_ptr, eps,
-                                      N_Q: tl.constexpr, N_KV: tl.constexpr, HEAD_DIM: tl.constexpr, HAS_NORM: tl.constexpr):
+                                      N_Q: tl.constexpr, N_KV: tl.constexpr, HEAD_DIM: tl.constexpr, HAS_NORM: tl.constexpr, WRITE_CACHE: tl.constexpr):
         """One program per (row, head): normalize + rotate Q/K heads (rounding where the unfused ops round), copy V, and store
         Q to its output and K/V straight into the cache slot."""
         row = tl.program_id(0)
@@ -106,11 +117,14 @@ if TRITON_AVAILABLE:
             a2 = (x2.to(tl.float32) * c2).to(dtype).to(tl.float32)
             r1 = (a1 + x2.to(tl.float32) * s1).to(dtype)
             r2 = (a2 + x1.to(tl.float32) * s2).to(dtype)
-            if head < N_Q:
-                dst = q_ptr + row * N_Q * HEAD_DIM + head * HEAD_DIM
+            if WRITE_CACHE:
+                if head < N_Q:
+                    dst = q_ptr + row * N_Q * HEAD_DIM + head * HEAD_DIM
+                else:
+                    slot = tl.load(slot_ptr + row)
+                    dst = key_cache_ptr + slot * (N_KV * HEAD_DIM) + (head - N_Q) * HEAD_DIM
             else:
-                slot = tl.load(slot_ptr + row)
-                dst = key_cache_ptr + slot * (N_KV * HEAD_DIM) + (head - N_Q) * HEAD_DIM
+                dst = q_ptr + row * (N_Q + N_KV) * HEAD_DIM + head * HEAD_DIM  # q_ptr is the [rows, N_Q + N_KV, HEAD_DIM] output
             tl.store(dst + offs, r1)
             tl.store(dst + HALF + offs, r2)
         else:
@@ -168,5 +182,24 @@ def qkv_norm_rotary_write(qkv, norm_weight, cosine, signed_sine, slot_mapping, k
     q = torch.empty(rows, n_query_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
     _qkv_norm_rotary_write_kernel[(rows, n_query_heads + 2 * n_kv_heads)](
         qkv, qkv if norm_weight is None else norm_weight.contiguous(), cosine.contiguous(), signed_sine.contiguous(), slot_mapping, q, key_cache, value_cache, eps,
-        N_Q=n_query_heads, N_KV=n_kv_heads, HEAD_DIM=head_dim, HAS_NORM=norm_weight is not None, num_warps=1)
+        N_Q=n_query_heads, N_KV=n_kv_heads, HEAD_DIM=head_dim, HAS_NORM=norm_weight is not None, WRITE_CACHE=True, num_warps=1)
     return q
+
+
+def qk_norm_rotary(qkv, norm_weight, cosine, signed_sine, n_query_heads, n_kv_heads, head_dim, eps):
+    """Prefill/any-length twin of `qkv_norm_rotary_write` without the cache write: one kernel replaces rms_norm, the weight
+    multiply, the rotary multiplies, the half-swap concatenate and the addcmul (about a quarter of prefill GPU time at batch 8)."""
+    usable = (TRITON_AVAILABLE and qkv.is_cuda and qkv.is_contiguous() and head_dim >= 2 and head_dim & (head_dim - 1) == 0
+              and cosine.dtype == qkv.dtype and signed_sine.dtype == qkv.dtype and (norm_weight is None or norm_weight.dtype == qkv.dtype))
+    if not usable:
+        return qk_norm_rotary_reference(qkv, norm_weight, cosine, signed_sine, n_query_heads, n_kv_heads, head_dim, eps)
+    batch, seq = qkv.shape[:2]
+    rows = batch * seq
+    n_qk = n_query_heads + n_kv_heads
+    out = torch.empty(batch, seq, n_qk, head_dim, device=qkv.device, dtype=qkv.dtype)
+    cos = cosine.reshape(rows, head_dim)
+    sin = signed_sine.reshape(rows, head_dim)
+    _qkv_norm_rotary_write_kernel[(rows, n_qk)](
+        qkv, qkv if norm_weight is None else norm_weight.contiguous(), cos, sin, cos, out, out, out, eps,
+        N_Q=n_query_heads, N_KV=n_kv_heads, HEAD_DIM=head_dim, HAS_NORM=norm_weight is not None, WRITE_CACHE=False, num_warps=1)
+    return out

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.layers import RMSNorm, apply_rotary_embedding
-from utils.fused_ops import qkv_norm_rotary_write
+from utils.fused_ops import qkv_norm_rotary_write, qk_norm_rotary
 from utils.paged_attention import paged_decode_attention, DEFAULT_NUM_SPLITS
 
 def joint_rotary(qk, cosine, signed_sine):
@@ -126,7 +126,13 @@ class SelfAttention(nn.Module):
             Q = K = None
         V = V.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
         cosine, sine = pos_embeddings[:2]
-        if self.q_norm is None:
+        if (self.fused_qkv_write and qk is not None and qkv.is_cuda and len(pos_embeddings) > 2 and self.joint_qk_rotary
+                and (self.q_norm is None or (self.q_norm.use_native and self.k_norm.use_native))):
+            norm_weight = None if self.q_norm is None else self.qk_norm_weight(qkv)
+            qk = qk_norm_rotary(qkv, norm_weight, cosine, pos_embeddings[2], self.n_query_heads, self.n_kv_heads, self.head_dim, self.q_norm.eps if self.q_norm is not None else 0.0)
+            Q = qk[:, :, :self.n_query_heads].permute(0, 2, 1, 3)
+            K = qk[:, :, self.n_query_heads:].permute(0, 2, 1, 3)
+        elif self.q_norm is None:
             if qk is None:
                 qk = torch.cat([Q.view(batch_size, seq_len, self.n_query_heads, self.head_dim), K.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)], dim=2)
             signed_sine = pos_embeddings[2] if len(pos_embeddings) > 2 else torch.cat([-sine[..., :self.head_dim // 2], sine[..., self.head_dim // 2:]], dim=-1)
