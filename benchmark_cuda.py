@@ -10,7 +10,7 @@ Timing is library-agnostic. For each (prompt length, batch size) configuration:
   * total_s  = time to generate `output_tokens` tokens for the whole batch
   * decode tok/s = batch * (output_tokens - 1) / (total_s - ttft_s)
 Every library is forced to generate exactly `output_tokens` tokens (EOS ignored) from the same token IDs, greedily.
-Prompts differ from their first KV block on, so prefix caching cannot help any library.
+Every (prompt length, batch size, repeat) uses its own prompts, differing from the first KV block on, so prefix caching cannot help any library.
 """
 import argparse
 import gc
@@ -205,10 +205,10 @@ def run_backend(args):
             for batch in batch_sizes:
                 entry = {"prompt_tokens": prompt_length, "batch": batch, "new_tokens": output_tokens}
                 try:
-                    backend.run(build_prompts(tokenizer, prompt_length, batch, "warm"), output_tokens)
+                    backend.run(build_prompts(tokenizer, prompt_length, batch, f"warm-{prompt_length}-{batch}"), output_tokens)
                     ttft, total, tokens = [], [], None
                     for repeat in range(args.repeats):
-                        prompts = build_prompts(tokenizer, prompt_length, batch, f"t1-{repeat}")
+                        prompts = build_prompts(tokenizer, prompt_length, batch, f"t1-{prompt_length}-{batch}-{repeat}")
                         sync(torch)
                         start = time.perf_counter()
                         backend.run(prompts, 1)
@@ -217,7 +217,7 @@ def run_backend(args):
                         if repeat == 0 and getattr(backend, "prefill_trace", None) is not None:
                             entry["prefill_batches"] = list(backend.prefill_trace)  # (requests, chunk lengths, start positions, packed) per forward pass
                     for repeat in range(args.repeats):
-                        prompts = build_prompts(tokenizer, prompt_length, batch, f"tn-{repeat}")
+                        prompts = build_prompts(tokenizer, prompt_length, batch, f"tn-{prompt_length}-{batch}-{repeat}")
                         sync(torch)
                         start = time.perf_counter()
                         generated = backend.run(prompts, output_tokens)
@@ -306,7 +306,7 @@ def profile_prefill(backend, tokenizer, args, torch):
         engine.process_prefill_work = traced
 
         def prefill_once(tag):
-            prompts = build_prompts(tokenizer, prompt_length, batch, tag)
+            prompts = build_prompts(tokenizer, prompt_length, batch, f"{tag}-{prompt_length}-{batch}")
             sync(torch)
             t0 = time.perf_counter()
             requests = [engine.add_request(None, prompt_token_ids=prompt) for prompt in prompts]
@@ -331,7 +331,7 @@ def profile_prefill(backend, tokenizer, args, torch):
                 sync(torch)
             benchmark_style = []
             for repeat in range(3):
-                prompts = build_prompts(tokenizer, prompt_length, batch, f"pb-{repeat}")
+                prompts = build_prompts(tokenizer, prompt_length, batch, f"pb-{prompt_length}-{batch}-{repeat}")
                 sync(torch)
                 t0 = time.perf_counter()
                 backend.run(prompts, 1)
