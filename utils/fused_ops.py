@@ -127,7 +127,7 @@ if TRITON_AVAILABLE:
                 dst = q_ptr + row * (N_Q + N_KV) * HEAD_DIM + head * HEAD_DIM  # q_ptr is the [rows, N_Q + N_KV, HEAD_DIM] output
             tl.store(dst + offs, r1)
             tl.store(dst + HALF + offs, r2)
-        else:
+        elif WRITE_CACHE:  # without the cache write the grid has no V programs; this also keeps the dummy slot pointer from being typed
             slot = tl.load(slot_ptr + row)
             dst = value_cache_ptr + slot * (N_KV * HEAD_DIM) + (head - N_Q - N_KV) * HEAD_DIM
             tl.store(dst + offs, x1)
