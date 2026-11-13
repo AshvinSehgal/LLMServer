@@ -153,7 +153,7 @@ note "benchmark exit code: $?"
 if [ "${ALLOW_NO_CUDA:-0}" != "1" ]; then
   python bench_attention.py > "$RESULTS/attention_bench.txt" 2>&1 || note "WARNING: bench_attention.py failed; see attention_bench.txt"
   python agreement_check.py --model "$MODEL" > "$RESULTS/agreement_check.txt" 2>&1 || note "WARNING: agreement_check.py failed; see agreement_check.txt"
-  note "agreement check:"; head -8 "$RESULTS/agreement_check.txt" | tee -a "$STATUS"
+  note "agreement check:"; grep -v "Loading checkpoint\|deprecated" "$RESULTS/agreement_check.txt" | head -12 | tee -a "$STATUS"
 fi
 
 if [ -f "$RESULTS/bench/report.md" ]; then
