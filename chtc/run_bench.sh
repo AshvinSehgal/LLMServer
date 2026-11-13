@@ -35,6 +35,7 @@ mkdir -p "$RESULTS"
 STATUS="$RESULTS/STATUS.txt"
 : > "$STATUS"
 note() { echo "$*" | tee -a "$STATUS"; }
+note "code version: $(cat VERSION 2>/dev/null || echo unknown)"
 
 # Always ship back whatever exists, even if a step failed.
 finish() {
