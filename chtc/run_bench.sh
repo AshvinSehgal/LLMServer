@@ -9,6 +9,8 @@
 #   RUN_TESTS    1 = run the GPU unit tests first                        (default 1)
 #   PROFILE      1 = write a kernel profile of the custom engine         (default 1)
 #   ABLATE       1 = also run custom without graphs / without the kernel (default 1)
+#   ATTN_BENCH   1 = run bench_attention.py (Qwen3-1.7B head layout)     (default 1)
+#   AGREEMENT    1 = run agreement_check.py (needs a float32 model copy)  (default 1)
 # Dry runs on a laptop only: ALLOW_NO_CUDA=1 SKIP_PIP=1 MODEL_PATH=/local/model/dir
 
 set -u
@@ -151,9 +153,12 @@ python benchmark_cuda.py --run-all --model "$MODEL" --backends "$BACKENDS" --out
 note "benchmark exit code: $?"
 
 if [ "${ALLOW_NO_CUDA:-0}" != "1" ]; then
-  python bench_attention.py > "$RESULTS/attention_bench.txt" 2>&1 || note "WARNING: bench_attention.py failed; see attention_bench.txt"
-  python agreement_check.py --model "$MODEL" > "$RESULTS/agreement_check.txt" 2>&1 || note "WARNING: agreement_check.py failed; see agreement_check.txt"
-  note "agreement check:"; grep -v "Loading checkpoint\|deprecated" "$RESULTS/agreement_check.txt" | head -12 | tee -a "$STATUS"
+  # bench_attention.py uses Qwen3-1.7B's head layout, so larger-model runs turn it off; agreement_check.py holds an extra float32 copy, so very large models turn it off too.
+  if [ "${ATTN_BENCH:-1}" = "1" ]; then python bench_attention.py > "$RESULTS/attention_bench.txt" 2>&1 || note "WARNING: bench_attention.py failed; see attention_bench.txt"; fi
+  if [ "${AGREEMENT:-1}" = "1" ]; then
+    python agreement_check.py --model "$MODEL" > "$RESULTS/agreement_check.txt" 2>&1 || note "WARNING: agreement_check.py failed; see agreement_check.txt"
+    note "agreement check:"; grep -v "Loading checkpoint\|deprecated" "$RESULTS/agreement_check.txt" | head -12 | tee -a "$STATUS"
+  fi
 fi
 
 if [ -f "$RESULTS/bench/report.md" ]; then

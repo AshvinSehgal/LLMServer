@@ -1,0 +1,36 @@
+# Larger models: Hugging Face vs this engine vs vLLM on one H200, one job per model.
+# Submit from the repo root:  condor_submit chtc/bench_large.sub   (sync first with chtc/transfer_to_chtc.sh)
+# Each job writes llmserver_results_<tag>.tar.gz next to where you submitted. Check "code version" in STATUS.txt.
+universe                = docker
+docker_image            = pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
+
+executable              = chtc/run_bench.sh
+arguments               = --prompt-tokens 128,1024 --batch-sizes 1,8,32 --output-tokens 128 --repeats 3 --dtype bfloat16
+# Tests already run on the 1.7B job; the ablation variants (no graphs / old kernels) and the 1.7B-shaped attention microbenchmark add time without new information here.
+environment             = "MODEL_ID=$(model) BACKENDS=hf,custom,vllm RUN_TESTS=0 PROFILE=1 ABLATE=0 ATTN_BENCH=0 AGREEMENT=$(agreement)"
+
+transfer_input_files    = utils, tests, benchmark.py, benchmark_cuda.py, agreement_check.py, bench_attention.py, VERSION
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+transfer_output_files   = llmserver_results.tar.gz
+transfer_output_remaps  = "llmserver_results.tar.gz = llmserver_results_$(tag).tar.gz"
+
+log                     = chtc/bench_large_$(tag)_$(Cluster).log
+output                  = chtc/bench_large_$(tag)_$(Cluster).out
+error                   = chtc/bench_large_$(tag)_$(Cluster).err
+
+request_gpus            = 1
+request_cpus            = 4
+request_memory          = 64GB
+request_disk            = 100GB
++WantGPULab             = true
++GPUJobLength           = "short"
+# Same GPU model as the 1.7B runs so the numbers are comparable across model sizes.
+require_gpus = (Capability == 9.0) && regexp("H200", DeviceName)
+gpus_minimum_memory     = 80000
+
+# tag, model, agreement check (the float32 copy fits next to the bf16 copies for 8B but not comfortably for 14B)
+queue tag, model, agreement from (
+  qwen3-8b,  Qwen/Qwen3-8B,  1
+  qwen3-14b, Qwen/Qwen3-14B, 0
+)
