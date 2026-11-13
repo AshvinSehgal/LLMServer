@@ -270,3 +270,46 @@ def test_batched_prefill_matches_per_request_prefill():
     assert caches[0][2] == caches[1][2]
     assert torch.allclose(outputs[0], outputs[1], atol=1e-5)
     assert torch.allclose(caches[0][0], caches[1][0], atol=1e-5) and torch.allclose(caches[0][1], caches[1][1], atol=1e-5)
+
+
+def test_batched_prefill_with_cached_prefixes_matches_per_request_prefill():
+    """Chunks that resume after a cached prefix, mixed with a fresh prompt, must match the per-request loop (outputs and cache)."""
+    from utils.model import Model
+    from utils.kv_cache import PagedKVCache
+    torch.manual_seed(0)
+    model = Model(vocab_size=50, hidden_size=32, intermediate_size=64, n_hidden_layers=2, head_dim=16, rope_theta=10000.0, n_query_heads=4, n_kv_heads=2, bias=False,
+                  attention_scaling=16 ** -0.5, rms_norm_eps=1e-6, use_sdpa=True).eval()
+    for parameter in model.parameters():
+        torch.nn.init.normal_(parameter, std=0.2)
+    first_lengths = {0: 8, 2: 6}  # requests 0 and 2 already have a cached prefix; request 1 is fresh
+    chunk_lengths = [5, 7, 3]
+    starts = [8, 0, 6]
+    full_ids = torch.randint(0, 50, (3, 16))
+    outputs, caches = [], []
+    for batched in (False, True):
+        cache = PagedKVCache(num_layers=2, num_blocks=40, block_size=4, num_kv_heads=2, head_dim=16, device="cpu", dtype=torch.float32)
+        cache.vectorized_prefill_write = True
+        tables = [[], [], []]
+        with torch.no_grad():
+            for request, length in first_lengths.items():  # phase 1: one request at a time through the per-request path
+                cache.batched_prefill = False
+                model(full_ids[request:request + 1, :length], kv_cache_manager=cache, request_ids=[request], block_tables=[tables[request]], start_pos=[0], input_lens=[length],
+                      logit_rows=torch.arange(1), logit_positions=torch.tensor([length - 1]))
+            padded = max(chunk_lengths)
+            ids = torch.zeros(3, padded, dtype=torch.long)
+            pos = torch.zeros(3, padded, dtype=torch.long)
+            for row, (start, length) in enumerate(zip(starts, chunk_lengths)):
+                ids[row, :length] = full_ids[row, start:start + length]
+                pos[row, :length] = torch.arange(start, start + length)
+            cache.batched_prefill = batched
+            ends = [start + length for start, length in zip(starts, chunk_lengths)]  # the mask PrefillBatch builds for the per-request path
+            offsets = torch.minimum(torch.arange(padded).unsqueeze(0), torch.tensor(chunk_lengths).unsqueeze(1) - 1) + torch.tensor(starts).unsqueeze(1)
+            blocked = (torch.arange(max(ends)).view(1, 1, 1, -1) > offsets[:, None, :, None]) | (torch.arange(max(ends)).view(1, 1, 1, -1) >= torch.tensor(ends).view(-1, 1, 1, 1))
+            mask = torch.zeros(blocked.shape).masked_fill_(blocked, torch.finfo(torch.float32).min)
+            hidden = model(ids, pos_ids=pos, causal_mask=mask, kv_cache_manager=cache, request_ids=[0, 1, 2], block_tables=tables, start_pos=starts, input_lens=chunk_lengths,
+                           logit_rows=torch.arange(3), logit_positions=torch.tensor([length - 1 for length in chunk_lengths]))
+        outputs.append(hidden)
+        caches.append((cache.key_cache.clone(), cache.value_cache.clone(), [list(table) for table in tables]))
+    assert caches[0][2] == caches[1][2]
+    assert torch.allclose(outputs[0], outputs[1], atol=1e-5)
+    assert torch.allclose(caches[0][0], caches[1][0], atol=1e-5) and torch.allclose(caches[0][1], caches[1][1], atol=1e-5)

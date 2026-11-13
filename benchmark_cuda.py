@@ -284,6 +284,7 @@ def profile_custom(backend, tokenizer, args, torch):
                 engine.cancel_request(request.request_id)
             engine.graph_runner = runner
     lines += profile_prefill(backend, tokenizer, args, torch)
+    lines += profile_mixed_prefill(backend, tokenizer, args, torch)
     with open(args.profile_out, "w") as handle:
         handle.write("\n".join(lines))
 
@@ -346,6 +347,39 @@ def profile_prefill(backend, tokenizer, args, torch):
                      f"benchmark-style backend.run {[round(t * 1000, 1) for t in benchmark_style]} ms =====")
         lines.append(f"prefill forward passes (requests, chunk lengths, start positions, packed): {traced_batches}")
         lines.append(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25, max_name_column_width=70))
+    return lines
+
+
+def profile_mixed_prefill(backend, tokenizer, args, torch):
+    """Prefill of a batch where half the requests resume after a cached prefix and half are fresh, batched vs the per-request loop."""
+    engine = backend.engine
+    cache = engine.kv_cache
+    if not hasattr(cache, "batched_prefill"):
+        return []
+    prompt_length, batch = max(parse_ints(args.prompt_tokens)), min(32, max(parse_ints(args.batch_sizes)))
+    half = batch // 2
+    lines = [f"===== MIXED PREFILL: {half} requests with a cached prefix + {half} fresh, {prompt_length}-token prompts ====="]
+    original = cache.batched_prefill
+    try:
+        for batched in (True, False):
+            cache.batched_prefill = batched
+            times, trace = [], None
+            for repeat in range(3):
+                tag = f"mix-{batched}-{repeat}-{prompt_length}"
+                cached_prompts = build_prompts(tokenizer, prompt_length, half, tag + "-a")
+                backend.run(cached_prompts, 1)  # leaves their blocks in the prefix cache
+                mixed = cached_prompts + build_prompts(tokenizer, prompt_length, half, tag + "-b")
+                sync(torch)
+                start = time.perf_counter()
+                backend.run(mixed, 1)
+                sync(torch)
+                times.append((time.perf_counter() - start) * 1000)
+                trace = list(backend.prefill_trace)
+            lines.append(f"batched_prefill={batched}: {[round(t, 1) for t in times]} ms; passes (requests, chunk lengths, start positions, packed): {trace}")
+    except Exception as failure:
+        lines.append(f"mixed prefill failed: {type(failure).__name__}: {failure}")
+    finally:
+        cache.batched_prefill = original
     return lines
 
 

@@ -235,6 +235,15 @@ class SelfAttention(nn.Module):
                 # real tokens independent of the padding after them).
                 kv_cache.append_batch(layer_index, block_tables, input_lens, K, V)
                 attention_scores = F.scaled_dot_product_attention(Q, K, V, dropout_p=0.0, scale=self.attention_scaling, is_causal=True, enable_gqa=True)
+            elif (batch_size > 1 and seq_len > 1 and self.use_sdpa and SDPA_SUPPORTS_GQA and getattr(kv_cache, "batched_prefill", False)
+                  and max(input_lens) == seq_len and min(input_lens) >= 1):
+                # Chunks that resume after a cached prefix (alone or mixed with fresh prompts): write every request's new keys in one
+                # scatter, read each request's whole context back in one gather, and attend with a per-request causal mask.
+                kv_cache.append_batch(layer_index, block_tables, input_lens, K, V, start_pos)
+                end_positions = [start + length for start, length in zip(start_pos, input_lens)]
+                cached_keys, cached_values, _ = kv_cache.get_batch_ragged(layer_index, block_tables, end_positions)
+                mask = kv_cache.chunk_attention_mask(start_pos, input_lens, seq_len, cached_keys.shape[2])
+                attention_scores = F.scaled_dot_product_attention(Q, cached_keys, cached_values, attn_mask=mask, dropout_p=0.0, scale=self.attention_scaling, enable_gqa=True)
             else:
                 direct_output = batch_size == 1 and input_lens[0] == seq_len
                 attention_scores = None if direct_output else torch.zeros_like(Q)
