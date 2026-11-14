@@ -33,6 +33,24 @@ def choose_tile(group_pad):
     return 64 if group_pad <= 2 else 32 if group_pad <= 4 else 16
 
 
+MIN_TOKENS_PER_SPLIT = 256  # H200 sweep (bench_attention.py): 256-token slices were fastest at batch >= 8, within 2% of the best at batch 1
+MAX_SPLITS = 64
+
+
+def paged_split_plan(config, coverage):
+    """(num_splits, tokens_per_split) for contexts up to `coverage` tokens.
+
+    Small fixed slices keep many programs busy even for short contexts (idle slices exit immediately); the slice count bounds the
+    longest context a graph can serve, so very long contexts get fewer, longer slices instead of falling off the fast path.
+    """
+    group = config.num_attention_heads // config.num_key_value_heads
+    tile = choose_tile(max(2, next_power_of_two(group)))
+    tokens_per_split = -(-MIN_TOKENS_PER_SPLIT // tile) * tile
+    if -(-coverage // tokens_per_split) > MAX_SPLITS:
+        tokens_per_split = -(-(-(-coverage // MAX_SPLITS)) // tile) * tile
+    return min(MAX_SPLITS, next_power_of_two(-(-coverage // tokens_per_split))), tokens_per_split
+
+
 def default_tokens_per_split(num_blocks, block_size, num_splits, tile):
     """Smallest slice length (a multiple of tile) such that num_splits slices cover the whole cache."""
     per_split = -(-(num_blocks * block_size) // num_splits)

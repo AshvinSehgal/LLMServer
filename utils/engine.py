@@ -15,7 +15,7 @@ from utils.scheduler import Scheduler
 from utils.request import Request, RequestStatus, RequestFinishReason, CompletedRequest
 from utils.batch import PrefillBatch, PackedPrefillBatch, DecodeBatch
 from utils.kv_cache import PagedKVCache, KVCacheExhaustedError
-from utils.paged_attention import triton_attention_usable, choose_tile, next_power_of_two, DEFAULT_NUM_SPLITS
+from utils.paged_attention import triton_attention_usable, paged_split_plan, DEFAULT_NUM_SPLITS
 from utils.cuda_graph import CudaGraphDecodeRunner
 from utils.fused_ops import fused_ops_usable
 from utils.speculative import SpeculativeDecoder
@@ -23,8 +23,6 @@ from utils.speculative import SpeculativeDecoder
 STREAM_END = None
 BYTE_LEVEL_DECODER = {character: byte for byte, character in bytes_to_unicode().items()}
 MAX_PACKED_PREFILL_TOKENS = 512
-MIN_TOKENS_PER_SPLIT = 256  # H200 sweep (bench_attention.py): 256-token slices were fastest at batch >= 8, within 2% of the best at batch 1
-MAX_SPLITS = 64
 
 class ByteLevelStreamDecoder:
     def __init__(self, tokenizer):
@@ -82,7 +80,7 @@ class Engine:
             device=self.device,
             dtype=self.dtype
         )
-        self.setup_paged_decode(paged_decode, cuda_graphs, paged_context_limit, max_batch_size)
+        self.setup_paged_decode(paged_decode, cuda_graphs, paged_context_limit, max(max_batch_size, num_draft_tokens + 1 if draft_model is not None else 0))
         self.speculator = SpeculativeDecoder(self, draft_model, num_draft_tokens) if draft_model is not None else None
         if self.model.generation_config.bos_token_id is not None:
             self.bos_token_id = self.model.generation_config.bos_token_id
@@ -134,15 +132,8 @@ class Engine:
         if not self.paged_decode:
             return
         config = self.model.config
-        group = config.num_attention_heads // config.num_key_value_heads
-        tile = choose_tile(max(2, next_power_of_two(group)))
         coverage = min(paged_context_limit, self.num_blocks * self.block_size)
-        # Small fixed slices keep many programs busy even for short contexts (idle slices exit immediately); the slice
-        # count bounds the longest context the graph can serve.
-        tokens_per_split = -(-MIN_TOKENS_PER_SPLIT // tile) * tile
-        if -(-coverage // tokens_per_split) > MAX_SPLITS:
-            tokens_per_split = -(-(-(-coverage // MAX_SPLITS)) // tile) * tile  # very long contexts: fewer, longer slices instead of falling off the fast path
-        num_splits = min(MAX_SPLITS, next_power_of_two(-(-coverage // tokens_per_split)))
+        num_splits, tokens_per_split = paged_split_plan(config, coverage)
         self.kv_cache.paged_num_splits = num_splits
         self.kv_cache.paged_tokens_per_split = tokens_per_split
         self.paged_context_limit = num_splits * tokens_per_split

@@ -52,7 +52,8 @@ def main():
         args.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
     shapes = {"qkv": ((args.heads + 2 * args.kv_heads) * args.head_dim, args.hidden), "o_proj": (args.hidden, args.heads * args.head_dim),
               "gate_up": (2 * args.intermediate, args.hidden), "down": (args.hidden, args.intermediate), "lm_head": (args.vocab, args.hidden)}
-    sweep = list(itertools.product((32, 64, 128), (128, 256), (3, 5), (4, 8)))
+    sweep = [(bn, bk, st, w, 1) for bn, bk, st, w in itertools.product((32, 64, 128), (128, 256), (3, 5), (4, 8))]  # last field: split-K
+    sweep += [(bn, bk, st, 4, sk) for bn, bk, st, sk in itertools.product((32, 64), (128, 256), (3, 5), (2, 4, 8))]
     print(f"{torch.cuda.get_device_name()} | bf16 activations | times are per call, weights rotate over >200 MB so DRAM bandwidth is measured")
     for name, (n, k) in shapes.items():
         copies = min(16, max(2, int(200e6 // (n * k)) + 1))
@@ -66,21 +67,23 @@ def main():
             cublas = time_graph(lambda i: F.linear(x, w16[i % copies]))
             dequant = time_graph(lambda i: F.linear(x, w8[i % copies].to(torch.bfloat16) * scale[:, None]))
             rows_out = []
+            default = time_graph(lambda i: w8a16_matmul(x, w8[i % copies], scale))
+            rows_out.append(f"    triton int8 engine default: {default * 1000:7.1f} us  {n * k / default / 1e6:6.0f} GB/s")
             for label, weights, scl, weight_bytes in (("int8", w8, scale, n * k), ("bf16", w16, ones, 2 * n * k)):
                 best = None
-                for block_n, block_k, stages, warps in sweep:
+                for block_n, block_k, stages, warps, split in sweep:
                     try:
-                        ms = time_graph(lambda i: w8a16_matmul(x, weights[i % copies], scl, block_n, block_k, warps, stages))
+                        ms = time_graph(lambda i: w8a16_matmul(x, weights[i % copies], scl, block_n, block_k, warps, stages, split))
                     except Exception:
                         continue
                     if best is None or ms < best[0]:
-                        best = (ms, block_n, block_k, stages, warps)
+                        best = (ms, block_n, block_k, stages, warps, split)
                 if best is None:
                     rows_out.append(f"    triton {label}: no configuration compiled")
                     continue
-                ms, block_n, block_k, stages, warps = best
-                error = (w8a16_matmul(x, weights[0], scl, block_n, block_k, warps, stages).float() - (reference if label == "int8" else F.linear(x.float(), weights[0].float()))).abs().max().item()
-                rows_out.append(f"    triton {label}: {ms * 1000:7.1f} us  {weight_bytes / ms / 1e6:6.0f} GB/s  best of {len(sweep)}: block_n={block_n} block_k={block_k} stages={stages} warps={warps}  max err {error:.4f}")
+                ms, block_n, block_k, stages, warps, split = best
+                error = (w8a16_matmul(x, weights[0], scl, block_n, block_k, warps, stages, split).float() - (reference if label == "int8" else F.linear(x.float(), weights[0].float()))).abs().max().item()
+                rows_out.append(f"    triton {label}: {ms * 1000:7.1f} us  {weight_bytes / ms / 1e6:6.0f} GB/s  best of {len(sweep)}: block_n={block_n} block_k={block_k} stages={stages} warps={warps} split_k={split}  max err {error:.4f}")
             print(f"{name:8s} N={n:6d} K={k:5d} rows={rows:2d} | cuBLAS bf16 {cublas * 1000:7.1f} us ({2 * n * k / cublas / 1e6:5.0f} GB/s) | int8 dequant fallback {dequant * 1000:7.1f} us")
             print("\n".join(rows_out), flush=True)
         del w16, w8

@@ -31,6 +31,32 @@ def test_speculative_output_equals_plain_greedy_decoding(draft_seed, k, max_new_
     assert actual[0].finish_reason == RequestFinishReason.LENGTH
 
 
+@pytest.mark.parametrize("draft_seed", [0, 1])
+@pytest.mark.parametrize("k", [1, 3, 5])
+@pytest.mark.parametrize("max_new_tokens", [3, 7, 20])
+def test_paged_speculation_equals_plain_decoding(draft_seed, k, max_new_tokens):
+    """Draft steps and the target's check run as paged decode batches (the CUDA-graph path's dataflow, eager on CPU)."""
+    target = tiny_model(seed=0)
+    _, expected = run(target, PROMPTS, max_new_tokens, paged_decode=True)
+    engine, actual = run(target, PROMPTS, max_new_tokens, paged_decode=True, draft_model=tiny_model(seed=draft_seed), num_draft_tokens=k)
+    assert engine.speculator.paged and engine.speculator.rounds > 0
+    assert actual[0].generated_token_ids == expected[0].generated_token_ids
+    assert len(actual[0].generated_token_ids) == max_new_tokens
+
+
+def test_paged_speculation_with_identical_draft_accepts_everything_and_releases_blocks():
+    engine, _ = run(tiny_model(seed=0), PROMPTS, 24, paged_decode=True, draft_model=tiny_model(seed=0), num_draft_tokens=3)
+    assert engine.speculator.rounds > 0 and engine.speculator.accepted == engine.speculator.proposed
+    assert engine.speculator.tables == {} and engine.speculator.draft_cache.num_free_blocks == engine.speculator.draft_cache.num_blocks
+
+
+def test_paged_speculation_on_a_long_prompt_uses_the_eager_catch_up():
+    prompts = {"a": list(range(3, 40))}
+    _, expected = run(tiny_model(seed=0), prompts, 12, paged_decode=True)
+    _, actual = run(tiny_model(seed=0), prompts, 12, paged_decode=True, draft_model=tiny_model(seed=1), num_draft_tokens=4)
+    assert actual[0].generated_token_ids == expected[0].generated_token_ids
+
+
 def test_identical_draft_accepts_every_proposal():
     target = tiny_model(seed=0)
     engine, requests = run(target, PROMPTS, 24, draft_model=tiny_model(seed=0), num_draft_tokens=3)

@@ -318,12 +318,10 @@ def test_batched_prefill_with_cached_prefixes_matches_per_request_prefill():
 def test_paged_context_limit_grows_with_slice_length_beyond_the_default_slice_count():
     """A 40k-token cache must stay on the paged fast path: the engine lengthens its slices instead of capping at 64 x 256 tokens."""
     from types import SimpleNamespace
-    from utils import engine as engine_module
-    from utils.paged_attention import choose_tile, next_power_of_two
-    group, coverage = 2, 40000
-    tile = choose_tile(max(2, next_power_of_two(group)))
-    tokens_per_split = -(-engine_module.MIN_TOKENS_PER_SPLIT // tile) * tile
-    if -(-coverage // tokens_per_split) > engine_module.MAX_SPLITS:
-        tokens_per_split = -(-(-(-coverage // engine_module.MAX_SPLITS)) // tile) * tile
-    num_splits = min(engine_module.MAX_SPLITS, next_power_of_two(-(-coverage // tokens_per_split)))
-    assert num_splits * tokens_per_split >= coverage and num_splits <= engine_module.MAX_SPLITS
+    from utils.paged_attention import MAX_SPLITS, paged_split_plan
+    config = SimpleNamespace(num_attention_heads=16, num_key_value_heads=8)  # group of 2
+    for coverage in (4096, 16512, 40000):
+        num_splits, tokens_per_split = paged_split_plan(config, coverage)
+        assert num_splits * tokens_per_split >= coverage and num_splits <= MAX_SPLITS
+    assert paged_split_plan(config, 4096) == (16, 256)  # short contexts keep the 256-token slices
+    assert paged_split_plan(config, 40000)[1] > 256

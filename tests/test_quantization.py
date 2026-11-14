@@ -236,6 +236,28 @@ def test_w8a16_kernel_matches_dequantized_matmul(rows, shape, dtype):
     assert torch.allclose(layer(x).float(), expected, rtol=2e-2, atol=2e-2 * expected.abs().max().item())  # the layer picks the kernel for these row counts
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [1, 8, 32])
+@pytest.mark.parametrize("split_k", [1, 2, 3, 4, 8])
+def test_w8a16_split_k_matches_and_is_deterministic(rows, split_k):
+    from utils.quant_kernels import TRITON_AVAILABLE, w8a16_matmul
+    if not TRITON_AVAILABLE:
+        pytest.skip("Triton required")
+    layer, x = _int8_case(rows, 512, 4096, torch.bfloat16, "cuda")
+    expected = torch.nn.functional.linear(x.float(), layer.weight.float() * layer.scale.float()[:, None])
+    first = w8a16_matmul(x, layer.weight, layer.scale, block_n=32, block_k=128, split_k=split_k)
+    assert torch.allclose(first.float(), expected, rtol=2e-2, atol=2e-2 * expected.abs().max().item())
+    assert torch.equal(first, w8a16_matmul(x, layer.weight, layer.scale, block_n=32, block_k=128, split_k=split_k))
+    assert torch.allclose(w8a16_matmul(x, layer.weight, layer.scale).float(), expected, rtol=2e-2, atol=2e-2 * expected.abs().max().item())  # the automatic split
+
+
+def test_auto_split_k_targets_narrow_outputs_only():
+    from utils.quant_kernels import auto_split_k
+    assert auto_split_k(4096, 12288, 1, 32, 256) == 4 and auto_split_k(4096, 4096, 8, 32, 256) == 4  # narrow output: split
+    assert auto_split_k(24576, 4096, 1, 64, 128) == 1 and auto_split_k(151936, 4096, 1, 64, 128) == 1  # wide output: already enough programs
+    assert auto_split_k(4096, 256, 1, 32, 256) == 1  # too little K to split
+
+
 def test_int8_linear_unchanged_off_cuda():
     layer, x = _int8_case(5, 64, 32, torch.float32, "cpu")
     expected = torch.nn.functional.linear(x, layer.weight.float() * layer.scale[:, None])

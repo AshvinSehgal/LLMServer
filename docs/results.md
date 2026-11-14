@@ -70,6 +70,11 @@ At batch 32 with 1024-token contexts the attention kernel change alone took the 
 
 **int8 weight-only kernel** (`chtc/bench_quant.sub`, `bench_gemm.py` at 8B and 14B shapes, 1/8/32 rows). The Triton int8 kernel is faster than the old dequantize fallback by 5x to 14x but slower than cuBLAS bf16 for most projections: it reads half the bytes yet reaches only 0.8 to 2.1 TB/s against cuBLAS's 2.3 to 3.9 TB/s. It wins only for `gate_up` at 1 to 8 rows (46.6 vs 52.3 us on the 8B) and `lm_head` (236 vs 306 us); `down` (K=12288) is 1.6x to 2x slower. Summed over one 8B layer it is about 0.85x of bf16, so int8 is a memory saving here, not a speed-up. Narrow outputs (N=4096 gives only 128 programs on 132 SMs, each streaming a long K) probably need split-K. The perplexity and end-to-end int8 runs failed (a `datasets` install pulled in a huggingface-hub that `transformers` rejects); the job now pins it.
 
+## Changes since those results (v9.31, untested on a GPU)
+
+- **Speculative decoding now runs on the graph path.** Each draft step is a graph-replayed single-token decode on the draft's own paged cache, and the target checks the k+1 tokens as a decode batch of k+1 rows sharing one block table (row j: position start+j, context length start+j+1). The fused QKV kernel writes every row's key and value before attention reads them, so each row sees the earlier ones. This uses the same graphs and kernels as ordinary decoding and adds no kernel. The target's graph runner is now sized for at least k+1 rows. The CPU tests check that output equals plain decoding on this path; the speed is the open question for `chtc/bench_spec.sub`. Expected cost per round at k=3: about 4 draft steps (2 ms each for the 0.6B) plus one 4-row target step (about 7 ms for the 8B), so about 15 ms for 2.8 tokens, against 6.3 ms per token plain.
+- **int8 kernel gets split-K** for narrow outputs (`o_proj`, `qkv`, `down`): the K range is split across programs, each writing an fp32 partial, and the partials are summed in a fixed order (deterministic). Block sizes now default from the sweep (64 x 128 for wide outputs, 32 x 256 otherwise). `bench_gemm.py` sweeps split-K and prints the engine's default configuration beside the best one.
+
 ## Experiments still to run
 
-Re-run `chtc/bench_quant.sub`, `chtc/bench_families.sub` (Mistral only) after the pip fixes.
+Re-run `chtc/bench_spec.sub` and `chtc/bench_quant.sub` (the quality evaluation and end-to-end int8 never ran), and the Mistral entry of `chtc/bench_families.sub`.
