@@ -7,7 +7,7 @@ executable              = chtc/run_bench.sh
 arguments               = --prompt-tokens 128,1024 --batch-sizes 1,8,32 --output-tokens 128 --repeats 3 --dtype bfloat16
 environment             = "MODEL_ID=$(model) BACKENDS=hf,custom,custom-int8,vllm RUN_TESTS=1 PROFILE=0 ABLATE=0 ATTN_BENCH=0 AGREEMENT=0 GEMM=1 QUALITY=1"
 
-transfer_input_files    = utils, tests, benchmark.py, benchmark_cuda.py, agreement_check.py, bench_attention.py, bench_prompts.py, bench_spec.py, bench_spec_vllm.py, bench_gemm.py, eval_quality.py, VERSION
+transfer_input_files    = utils, tests, benchmark.py, benchmark_cuda.py, agreement_check.py, bench_attention.py, bench_prompts.py, bench_spec.py, bench_spec_vllm.py, bench_gemm.py, eval_quality.py, serve_bench.py, server.py, web, VERSION
 should_transfer_files   = YES
 when_to_transfer_output = ON_EXIT
 transfer_output_files   = llmserver_results.tar.gz

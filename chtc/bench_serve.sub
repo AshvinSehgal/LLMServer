@@ -1,0 +1,34 @@
+# Serving under load on an H200: Poisson arrivals against this repo's server.py and against `vllm serve`.
+# Reports throughput and p50/p90/p99 time-to-first-token and time-per-output-token per arrival rate.
+# Submit from the repo root:  condor_submit chtc/bench_serve.sub
+universe                = docker
+docker_image            = pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
+
+executable              = chtc/run_bench.sh
+arguments               =
+environment             = "MODE=serve MODEL_ID=$(model) BACKENDS=vllm RUN_TESTS=0 ATTN_BENCH=0 AGREEMENT=0 RATES=$(rates) SERVE_REQUESTS=96"
+
+transfer_input_files    = utils, tests, web, server.py, benchmark.py, benchmark_cuda.py, agreement_check.py, bench_attention.py, bench_prompts.py, bench_spec.py, bench_spec_vllm.py, bench_gemm.py, eval_quality.py, serve_bench.py, VERSION
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+transfer_output_files   = llmserver_results.tar.gz
+transfer_output_remaps  = "llmserver_results.tar.gz = llmserver_results_$(tag).tar.gz"
+
+log                     = chtc/bench_serve_$(tag)_$(Cluster).log
+output                  = chtc/bench_serve_$(tag)_$(Cluster).out
+error                   = chtc/bench_serve_$(tag)_$(Cluster).err
+
+request_gpus            = 1
+request_cpus            = 8
+request_memory          = 64GB
+request_disk            = 100GB
++WantGPULab             = true
++GPUJobLength           = "short"
+require_gpus = (Capability == 9.0) && regexp("H200", DeviceName)
+gpus_minimum_memory     = 80000
+
+# rates are colon-separated (queue-from splits on commas); "inf" sends every request at once
+queue tag, model, rates from (
+  serve-8b,   Qwen/Qwen3-8B,   2:4:8:16:inf
+  serve-1p7b, Qwen/Qwen3-1.7B, 4:8:16:32:inf
+)

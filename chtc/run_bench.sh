@@ -9,7 +9,8 @@
 #   RUN_TESTS    1 = run the GPU unit tests first                        (default 1)
 #   PROFILE      1 = write a kernel profile of the custom engine         (default 1)
 #   ABLATE       1 = also run custom without graphs / without the kernel (default 1)
-#   MODE         bench (default) or spec (speculative decoding; needs DRAFT_ID, optional DRAFT_TOKENS, NEW_TOKENS)
+#   MODE         bench (default), spec or serve (load test of server.py vs vllm serve; RATES, SERVE_REQUESTS)
+#                spec: (speculative decoding; needs DRAFT_ID, optional DRAFT_TOKENS, NEW_TOKENS)
 #   GEMM         1 = run bench_gemm.py (int8 / bf16 matmul kernels)        (default 0)
 #   QUALITY      1 = run eval_quality.py (WikiText-2 perplexity)           (default 0)
 #   ATTN_BENCH   1 = run bench_attention.py (Qwen3-1.7B head layout)     (default 1)
@@ -154,6 +155,34 @@ if [ "${QUALITY:-0}" = "1" ]; then
   pip install --user -q datasets >> "$RESULTS/pip.txt" 2>&1 || note "WARNING: pip install datasets failed (see pip.txt)"
   python eval_quality.py --model "$MODEL" --windows "${QUALITY_WINDOWS:-40}" > "$RESULTS/quality.txt" 2>&1 || note "WARNING: eval_quality.py failed; see quality.txt"
   note "quality:"; grep -v "Loading\|Fetching\|Warning\|deprecated\|tokenizers\|TOKENIZERS\|Avoid\|Explicitly\|To disable" "$RESULTS/quality.txt" | tee -a "$STATUS"
+fi
+
+if [ "${MODE:-bench}" = "serve" ]; then
+  # Serving comparison: the same Poisson-arrival workload against this repo's server.py and against `vllm serve`, one at a time.
+  pip install --user -q fastapi uvicorn httpx >> "$RESULTS/pip.txt" 2>&1 || note "WARNING: pip install of fastapi/uvicorn/httpx failed (see pip.txt)"
+  serve_one() {  # serve_one <name> <port> <command...>
+    local name=$1 port=$2; shift 2
+    "$@" > "$RESULTS/serve_${name}_server.log" 2>&1 &
+    local server_pid=$!
+    local ready=0
+    for _ in $(seq 1 450); do
+      if python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:$port/health', timeout=3).status == 200 else 1)" 2>/dev/null; then ready=1; break; fi
+      kill -0 "$server_pid" 2>/dev/null || break
+      sleep 2
+    done
+    if [ "$ready" = "1" ]; then
+      python serve_bench.py --base-url "http://127.0.0.1:$port" --model "$MODEL_ID" --rates "$(echo "${RATES:-2,4,8,16,inf}" | tr : ,)" --requests "${SERVE_REQUESTS:-96}" --json "$RESULTS/serve_${name}.json" > "$RESULTS/serve_${name}.txt" 2>&1 || note "WARNING: load test against $name failed; see serve_${name}.txt"
+      note "serving results, $name:"; grep "^rate" "$RESULTS/serve_${name}.txt" | tee -a "$STATUS"
+    else
+      note "WARNING: $name server did not become ready; see serve_${name}_server.log"
+    fi
+    kill "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null
+  }
+  serve_one engine 18000 python server.py --model "$MODEL" --device cuda --dtype bfloat16 --max-batch-size 32 --max-context 4096 --max-new-tokens 256 --max-num-batched-tokens 8192 --host 127.0.0.1 --port 18000
+  if [ -n "$VLLM_PYTHON" ]; then
+    serve_one vllm 18001 "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server --model "$MODEL" --served-model-name "$MODEL_ID" --dtype bfloat16 --max-model-len 4096 --max-num-seqs 32 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.85 --host 127.0.0.1 --port 18001
+  fi
+  exit 0
 fi
 
 if [ "${MODE:-bench}" = "spec" ]; then

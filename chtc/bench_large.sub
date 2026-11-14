@@ -9,7 +9,7 @@ arguments               = --prompt-tokens 128,1024 --batch-sizes 1,8,32 --output
 # Tests already run on the 1.7B job; the ablation variants (no graphs / old kernels) and the 1.7B-shaped attention microbenchmark add time without new information here.
 environment             = "MODEL_ID=$(model) BACKENDS=hf,custom,vllm RUN_TESTS=0 PROFILE=1 ABLATE=0 ATTN_BENCH=0 AGREEMENT=$(agreement)"
 
-transfer_input_files    = utils, tests, benchmark.py, benchmark_cuda.py, agreement_check.py, bench_attention.py, bench_prompts.py, bench_spec.py, bench_spec_vllm.py, bench_gemm.py, eval_quality.py, VERSION
+transfer_input_files    = utils, tests, benchmark.py, benchmark_cuda.py, agreement_check.py, bench_attention.py, bench_prompts.py, bench_spec.py, bench_spec_vllm.py, bench_gemm.py, eval_quality.py, serve_bench.py, server.py, web, VERSION
 should_transfer_files   = YES
 when_to_transfer_output = ON_EXIT
 transfer_output_files   = llmserver_results.tar.gz
