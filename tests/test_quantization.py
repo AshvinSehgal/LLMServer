@@ -209,3 +209,34 @@ def test_int8_linear_supports_dimensions_the_mps_kernel_rejects(rows):
     hidden_states = torch.randn(rows, 48, device="mps", dtype=torch.float16)
     with torch.inference_mode():
         torch.testing.assert_close(quantized(hidden_states), linear(hidden_states), rtol=0.05, atol=0.05)
+
+
+def _int8_case(rows, out_features, in_features, dtype, device):
+    from utils.layers import Int8Linear
+    torch.manual_seed(3)
+    linear = torch.nn.Linear(in_features, out_features, bias=False).to(device=device, dtype=dtype)
+    torch.nn.init.normal_(linear.weight, std=0.05)
+    layer = Int8Linear.from_linear(linear)
+    x = torch.randn(rows, in_features, device=device, dtype=dtype)
+    return layer, x
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [1, 3, 8, 16, 17, 32, 64])
+@pytest.mark.parametrize("shape", [(256, 128), (1000, 192), (6144, 2048)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_w8a16_kernel_matches_dequantized_matmul(rows, shape, dtype):
+    from utils.quant_kernels import TRITON_AVAILABLE, w8a16_matmul
+    if not TRITON_AVAILABLE:
+        pytest.skip("Triton required")
+    layer, x = _int8_case(rows, shape[0], shape[1], dtype, "cuda")
+    expected = torch.nn.functional.linear(x.float(), layer.weight.float() * layer.scale.float()[:, None])
+    actual = w8a16_matmul(x, layer.weight, layer.scale).float()
+    assert torch.allclose(actual, expected, rtol=2e-2, atol=2e-2 * expected.abs().max().item())
+    assert torch.allclose(layer(x).float(), expected, rtol=2e-2, atol=2e-2 * expected.abs().max().item())  # the layer picks the kernel for these row counts
+
+
+def test_int8_linear_unchanged_off_cuda():
+    layer, x = _int8_case(5, 64, 32, torch.float32, "cpu")
+    expected = torch.nn.functional.linear(x, layer.weight.float() * layer.scale[:, None])
+    assert torch.allclose(layer(x), expected, atol=1e-4)

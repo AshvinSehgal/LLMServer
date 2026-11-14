@@ -10,6 +10,8 @@
 #   PROFILE      1 = write a kernel profile of the custom engine         (default 1)
 #   ABLATE       1 = also run custom without graphs / without the kernel (default 1)
 #   MODE         bench (default) or spec (speculative decoding; needs DRAFT_ID, optional DRAFT_TOKENS, NEW_TOKENS)
+#   GEMM         1 = run bench_gemm.py (int8 / bf16 matmul kernels)        (default 0)
+#   QUALITY      1 = run eval_quality.py (WikiText-2 perplexity)           (default 0)
 #   ATTN_BENCH   1 = run bench_attention.py (Qwen3-1.7B head layout)     (default 1)
 #   AGREEMENT    1 = run agreement_check.py (needs a float32 model copy)  (default 1)
 # Dry runs on a laptop only: ALLOW_NO_CUDA=1 SKIP_PIP=1 MODEL_PATH=/local/model/dir
@@ -143,6 +145,15 @@ if [ "$RUN_TESTS" = "1" ] && python -c "import pytest" 2>/dev/null; then
   note "unit tests: $(tail -1 "$RESULTS/gpu_tests.txt")"
   grep -E '^FAILED|^ERROR' "$RESULTS/gpu_tests.txt" | head -20 | tee -a "$STATUS"
   note "skipped tests by reason:"; grep -E '^SKIPPED' "$RESULTS/gpu_tests.txt" | sed 's/^SKIPPED \[[0-9]*\] //' | sort | uniq -c | tee -a "$STATUS"
+fi
+
+if [ "${GEMM:-0}" = "1" ]; then
+  python bench_gemm.py --model "$MODEL" > "$RESULTS/gemm_bench.txt" 2>&1 || note "WARNING: bench_gemm.py failed; see gemm_bench.txt"
+fi
+if [ "${QUALITY:-0}" = "1" ]; then
+  pip install --user -q datasets >> "$RESULTS/pip.txt" 2>&1 || note "WARNING: pip install datasets failed (see pip.txt)"
+  python eval_quality.py --model "$MODEL" --windows "${QUALITY_WINDOWS:-40}" > "$RESULTS/quality.txt" 2>&1 || note "WARNING: eval_quality.py failed; see quality.txt"
+  note "quality:"; grep -v "Loading\|Fetching\|Warning\|deprecated\|tokenizers\|TOKENIZERS\|Avoid\|Explicitly\|To disable" "$RESULTS/quality.txt" | tee -a "$STATUS"
 fi
 
 if [ "${MODE:-bench}" = "spec" ]; then

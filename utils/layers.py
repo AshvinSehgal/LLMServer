@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from utils.quant_kernels import w8a16_usable, w8a16_matmul
 
 class Int8Linear(nn.Module):
     """Weight-only int8 linear layer with one scale per output channel.
@@ -47,6 +48,8 @@ class Int8Linear(nn.Module):
                 output = torch._weight_int8pack_mm(F.pad(flat, (0, 0, 0, self.PAD_ROWS_TO - rows)), self.weight, self.scale)[:rows]
             else:
                 output = torch._weight_int8pack_mm(flat, self.weight, self.scale)
+        elif w8a16_usable(flat, self.weight) and self.scale.dtype == flat.dtype:
+            output = w8a16_matmul(flat, self.weight, self.scale)  # CUDA decode: reads int8 bytes, no 16-bit copy of the weight
         else:
             output = F.linear(flat, self.weight.to(flat.dtype) * self.scale.to(flat.dtype)[:, None])
         if self.bias is not None:

@@ -84,7 +84,7 @@ class HFBackend:
 
 
 class CustomBackend:
-    """This engine. Variants: graph (paged Triton attention + CUDA graphs), eager (paged, no graphs), gather (previous path)."""
+    """This engine. Variants: graph (paged Triton attention + CUDA graphs), eager (paged, no graphs), gather (previous path), int8 (graph + weight-only int8)."""
 
     def __init__(self, args, torch_module, variant="graph"):
         from transformers import AutoTokenizer
@@ -95,7 +95,7 @@ class CustomBackend:
         self.device = pick_device(torch_module, args.device)
         self.args = args
         self.tokenizer = AutoTokenizer.from_pretrained(args.model)
-        self.model = model_loader(args.model, device=torch_module.device(self.device), dtype=getattr(torch_module, args.dtype), quantize=args.custom_quantize)
+        self.model = model_loader(args.model, device=torch_module.device(self.device), dtype=getattr(torch_module, args.dtype), quantize=args.custom_quantize or ("int8" if variant == "int8" else None))
         self.engine = None
 
     def prepare(self, max_batch, max_length):
@@ -111,7 +111,7 @@ class CustomBackend:
             wanted = min(wanted, int(free_bytes * 0.8 // bytes_per_block))
         # The paged Triton path and CUDA graphs only exist on CUDA; elsewhere every variant uses the default decode path.
         on_cuda = self.device == "cuda"
-        options = {"paged_decode": self.variant != "gather" if on_cuda else False, "cuda_graphs": self.variant == "graph" if on_cuda else False}
+        options = {"paged_decode": self.variant != "gather" if on_cuda else False, "cuda_graphs": self.variant in ("graph", "int8") if on_cuda else False}
         self.engine = Engine(self.model, self.tokenizer, max_new_tokens=1, max_batch_size=max_batch, max_num_batched_tokens=self.args.max_num_batched_tokens,
                              kv_cache_num_blocks=wanted, kv_cache_block_size=block_size, stream_text=False, max_completed_requests=0,
                              ignore_eos=True, paged_context_limit=max(8192, max_length), **options)
