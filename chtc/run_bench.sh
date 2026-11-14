@@ -153,10 +153,10 @@ print(snapshot_download("$DRAFT_ID"))
 PYEOF
 )"
   note "draft model: $DRAFT_PATH"
-  python bench_spec.py --model "$MODEL" --draft-model "$DRAFT_PATH" --draft-tokens "${DRAFT_TOKENS:-3,5}" --new-tokens "${NEW_TOKENS:-128}" > "$RESULTS/spec_engine.txt" 2>&1 || note "WARNING: bench_spec.py failed; see spec_engine.txt"
+  python bench_spec.py --model "$MODEL" --draft-model "$DRAFT_PATH" --draft-tokens "$(echo "${DRAFT_TOKENS:-3,5}" | tr : ,)" --new-tokens "${NEW_TOKENS:-128}" > "$RESULTS/spec_engine.txt" 2>&1 || note "WARNING: bench_spec.py failed; see spec_engine.txt"
   grep -v "Fetching\|Loading\|Warning\|deprecated" "$RESULTS/spec_engine.txt" | tee -a "$STATUS"
   if [ -n "$VLLM_PYTHON" ]; then
-    "$VLLM_PYTHON" bench_spec_vllm.py --model "$MODEL" --draft-model "$DRAFT_PATH" --draft-tokens "${DRAFT_TOKENS:-3,5}" --new-tokens "${NEW_TOKENS:-128}" > "$RESULTS/spec_vllm.txt" 2>&1 || note "WARNING: bench_spec_vllm.py failed; see spec_vllm.txt"
+    "$VLLM_PYTHON" bench_spec_vllm.py --model "$MODEL" --draft-model "$DRAFT_PATH" --draft-tokens "$(echo "${DRAFT_TOKENS:-3,5}" | tr : ,)" --new-tokens "${NEW_TOKENS:-128}" > "$RESULTS/spec_vllm.txt" 2>&1 || note "WARNING: bench_spec_vllm.py failed; see spec_vllm.txt"
     grep "^vLLM" "$RESULTS/spec_vllm.txt" | tee -a "$STATUS"
   fi
   exit 0

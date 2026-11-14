@@ -1,6 +1,6 @@
 # Speculative decoding on an H200: this engine plain vs with a small draft model (and vLLM's numbers where it supports draft models).
 # Batch 1, natural chat prompts. Submit from the repo root:  condor_submit chtc/bench_spec.sub
-# Each job writes llmserver_results_<tag>.tar.gz; read STATUS.txt (engine and vLLM lines are copied into it).
+# (Draft lengths are colon-separated because queue-from items split on commas.) Each job writes llmserver_results_<tag>.tar.gz; read STATUS.txt (engine and vLLM lines are copied into it).
 universe                = docker
 docker_image            = pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
 
@@ -28,7 +28,7 @@ require_gpus = (Capability == 9.0) && regexp("H200", DeviceName)
 gpus_minimum_memory     = 80000
 
 queue tag, model, draft, ks from (
-  spec-8b-0p6b,  Qwen/Qwen3-8B,  Qwen/Qwen3-0.6B, "3,5,7"
-  spec-14b-0p6b, Qwen/Qwen3-14B, Qwen/Qwen3-0.6B, "3,5,7"
-  spec-14b-1p7b, Qwen/Qwen3-14B, Qwen/Qwen3-1.7B, "3,5"
+  spec-8b-0p6b,  Qwen/Qwen3-8B,  Qwen/Qwen3-0.6B, 3:5:7
+  spec-14b-0p6b, Qwen/Qwen3-14B, Qwen/Qwen3-0.6B, 3:5:7
+  spec-14b-1p7b, Qwen/Qwen3-14B, Qwen/Qwen3-1.7B, 3:5
 )
