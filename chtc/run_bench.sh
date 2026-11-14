@@ -9,6 +9,7 @@
 #   RUN_TESTS    1 = run the GPU unit tests first                        (default 1)
 #   PROFILE      1 = write a kernel profile of the custom engine         (default 1)
 #   ABLATE       1 = also run custom without graphs / without the kernel (default 1)
+#   MODE         bench (default) or spec (speculative decoding; needs DRAFT_ID, optional DRAFT_TOKENS, NEW_TOKENS)
 #   ATTN_BENCH   1 = run bench_attention.py (Qwen3-1.7B head layout)     (default 1)
 #   AGREEMENT    1 = run agreement_check.py (needs a float32 model copy)  (default 1)
 # Dry runs on a laptop only: ALLOW_NO_CUDA=1 SKIP_PIP=1 MODEL_PATH=/local/model/dir
@@ -142,6 +143,23 @@ if [ "$RUN_TESTS" = "1" ] && python -c "import pytest" 2>/dev/null; then
   note "unit tests: $(tail -1 "$RESULTS/gpu_tests.txt")"
   grep -E '^FAILED|^ERROR' "$RESULTS/gpu_tests.txt" | head -20 | tee -a "$STATUS"
   note "skipped tests by reason:"; grep -E '^SKIPPED' "$RESULTS/gpu_tests.txt" | sed 's/^SKIPPED \[[0-9]*\] //' | sort | uniq -c | tee -a "$STATUS"
+fi
+
+if [ "${MODE:-bench}" = "spec" ]; then
+  # Speculative decoding comparison (batch 1, natural chat prompts): this engine plain vs with a draft model, then vLLM's own numbers.
+  DRAFT_PATH="$(python - <<PYEOF 2>>"$RESULTS/download.txt"
+from huggingface_hub import snapshot_download
+print(snapshot_download("$DRAFT_ID"))
+PYEOF
+)"
+  note "draft model: $DRAFT_PATH"
+  python bench_spec.py --model "$MODEL" --draft-model "$DRAFT_PATH" --draft-tokens "${DRAFT_TOKENS:-3,5}" --new-tokens "${NEW_TOKENS:-128}" > "$RESULTS/spec_engine.txt" 2>&1 || note "WARNING: bench_spec.py failed; see spec_engine.txt"
+  grep -v "Fetching\|Loading\|Warning\|deprecated" "$RESULTS/spec_engine.txt" | tee -a "$STATUS"
+  if [ -n "$VLLM_PYTHON" ]; then
+    "$VLLM_PYTHON" bench_spec_vllm.py --model "$MODEL" --draft-model "$DRAFT_PATH" --draft-tokens "${DRAFT_TOKENS:-3,5}" --new-tokens "${NEW_TOKENS:-128}" > "$RESULTS/spec_vllm.txt" 2>&1 || note "WARNING: bench_spec_vllm.py failed; see spec_vllm.txt"
+    grep "^vLLM" "$RESULTS/spec_vllm.txt" | tee -a "$STATUS"
+  fi
+  exit 0
 fi
 
 EXTRA=()
