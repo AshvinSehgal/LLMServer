@@ -48,4 +48,4 @@ bench_results/
 chtc/*.log
 chtc/*.out
 chtc/*.err
-llmserver_results.tar.gz
+llmserver_results*.tar.gz
