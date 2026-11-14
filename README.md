@@ -29,8 +29,8 @@ The project currently targets the Qwen3 architecture and uses Hugging Face only 
 - Optional weight-only int8 quantization (`model_loader(..., quantize="int8")`, `benchmark.py --quantize int8`): per-output-channel scales and PyTorch's `_weight_int8pack_mm`, which halves weight memory and roughly 1.8x's batch-1 decode on MPS; it is lossy, so outputs can diverge from the fp16 reference
 - Experimental int4 mode (`quantize="int4"`, MPS only): group-wise int4 decoder weights for 1-2 row decode steps, with an int8 copy for larger batches and prefill because MPS's int4 kernel is slow beyond a few rows; `lm_head` stays int8. About 25% faster than int8 at batch 1 but uses more memory than int8 and is noticeably lossy (perplexity about +22% on the test text), so it is off by default
 
-- CUDA decode path (untested on a GPU until run via CHTC): split-KV paged-attention Triton kernels that read per-request block tables on the device, slot-mapped KV writes, and CUDA-graph replay of the whole decode step per batch-size bucket (`utils/paged_attention.py`, `utils/cuda_graph.py`); pure-PyTorch references for every piece keep it testable on CPU/MPS, and contexts beyond `paged_context_limit` fall back to the gather path
-- `benchmark_cuda.py`: Hugging Face vs this engine vs vLLM on identical token IDs, one process per library, with optional ablations and a kernel profile; `chtc/` holds the HTCondor submit file and job script
+- CUDA path (measured on an H200, see [docs/results.md](docs/results.md)): tensor-core split-KV paged-attention Triton kernels that read per-request block tables on the device, one fused kernel for Q/K RMSNorm + rotary + KV write, fused residual-add + RMSNorm and SiLU*up kernels, CUDA-graph replay of the whole decode step per batch-size bucket, batched prefill (one cache scatter and one causal attention call per batch, including chunks that resume after a cached prefix), and a weight-only int8 matmul kernel for decode (`utils/paged_attention.py`, `utils/fused_ops.py`, `utils/quant_kernels.py`, `utils/cuda_graph.py`); pure-PyTorch references for every kernel keep the logic testable on CPU/MPS, and contexts beyond `paged_context_limit` fall back to the gather path. On Qwen3-1.7B/8B/14B it decodes at 0.88x to 1.17x of vLLM 0.11 and answers the first token faster at short prompts
+- `benchmark_cuda.py`: Hugging Face vs this engine vs vLLM on identical token IDs, one process per library, with optional ablations and a kernel profile; also `bench_attention.py`/`bench_gemm.py` (kernel microbenchmarks), `bench_spec.py` (speculative decoding), `eval_quality.py` (WikiText-2 perplexity), `agreement_check.py` (scores greedy divergences against a float32 model) and `serve_bench.py` (open-loop load test of any OpenAI-compatible server); `chtc/` holds the HTCondor submit files and job script
 
 Prefill writes each request's keys and values into blocks referenced by its block table. Later decode steps process only the newest token and read the previously cached history directly from those blocks. Finished and cancelled requests release their block references; complete, unreferenced prompt blocks remain cached until memory pressure evicts them.
 
@@ -120,9 +120,9 @@ The gather-plus-SDPA decode path is now the default when `model_loader()` target
 
 ## Development status
 
-The single-request model, custom transformer implementation, multi-request scheduler, paged KV cache, chunked prefill and prefix caching are implemented. The next development version focuses on profiling and faster GPU execution.
+The single-request model, custom transformer implementation, multi-request scheduler, paged KV cache, chunked prefill, prefix caching, speculative decoding, CUDA kernels and an OpenAI-compatible server (streaming, tool calling) are implemented. The CUDA path is benchmarked against vLLM in [docs/results.md](docs/results.md); the listed CHTC experiments (speculative decoding, int8, serving under load, long contexts, other model families) are prepared but not yet run.
 
-This repository is a learning project rather than a production-ready inference server. The paged decode path is implemented in PyTorch; optimized kernels, distributed inference and an HTTP API are planned for later iterations.
+This repository is a learning project rather than a production-ready inference server. It runs on one GPU (no tensor parallelism), decodes greedily only, and supports the decoder families listed below.
 
 
 ## Running the GPU comparison on CHTC
@@ -133,8 +133,16 @@ The job files follow the pattern of the working CS771 jobs (docker universe, inp
 chtc/transfer_to_chtc.sh <user@submit-node>     # rsync the repo (skips .env, conversation.md, caches, tarballs)
 # then, on the submit node, from the repo root:
 condor_submit chtc/smoke.sub                    # minutes: GPU unit tests + a tiny Hugging Face / custom run + kernel profile
-condor_submit chtc/bench.sub                    # full Hugging Face vs custom vs vLLM comparison
+condor_submit chtc/bench.sub                    # full Hugging Face vs custom vs vLLM comparison (Qwen3-1.7B)
+condor_submit chtc/bench_large.sub              # the same grid for Qwen3-8B and Qwen3-14B
+condor_submit chtc/bench_spec.sub               # speculative decoding with a draft model (engine and vLLM)
+condor_submit chtc/bench_quant.sub              # int8 weight-only: GEMM microbenchmark, perplexity, end-to-end
+condor_submit chtc/bench_serve.sub              # Poisson-arrival load test: server.py vs vllm serve
+condor_submit chtc/bench_long.sub               # 4k / 16k / 32k-token prompts
+condor_submit chtc/bench_families.sub           # Qwen2.5, Llama 3.1, Mistral
 ```
+
+Jobs from the multi-model files write `llmserver_results_<tag>.tar.gz`. `STATUS.txt` starts with `code version:` (the `VERSION` file) so a stale sync is obvious.
 
 Each job returns `llmserver_results.tar.gz` containing `results/STATUS.txt` (summary and tables), `gpu_tests.txt` (Triton and CUDA-graph unit tests), `bench/report.md`, `bench/profile.txt` (kernel profile) and raw JSON per library. vLLM is installed into its own virtualenv inside the job so its pinned PyTorch cannot affect the other two libraries. Run `python benchmark_cuda.py --help` for options; locally it also works on MPS/CPU for the Hugging Face and custom backends.
 
@@ -149,7 +157,7 @@ python server.py --model Qwen/Qwen3-1.7B --quantize int8 --max-context 8192
 
 Under the text box, a toolbar switches between Qwen3 1.7B, Qwen3 4B and Llama 3.2 3B (the list is `MODEL_CATALOG` in `server.py`) and toggles Qwen3's thinking mode. Only one model fits in memory, so switching unloads the current one and loads the next (about 15 s for a cached model; a first use downloads it, and Llama needs `HF_TOKEN` with the license accepted). The KV cache is sized for `--max-batch-size` (default 2) full-length conversations; raise it only if you have the memory.
 
-The UI (`web/index.html`, no build step) keeps conversations in the browser, streams tokens, shows tokens/s and time to first token, supports stop, regenerate, a system prompt, and Qwen3's optional thinking mode. Run it with the Python 3.12 environment (torch 2.14, transformers 4.56): under torch 2.11 + transformers 5.5 the output degenerates into repeated `!` and the server prints a warning. The engine decodes greedily, so `temperature`/`top_p` are accepted by the API but ignored. Follow-up messages reuse the KV blocks of earlier turns through the engine's prefix cache. Run `tests/test_server.py` for the API tests (they use a stub engine).
+The UI (`web/index.html`, no build step) keeps conversations in the browser, streams tokens, shows tokens/s and time to first token, supports stop, regenerate, a system prompt, and Qwen3's optional thinking mode. Run it with the Python 3.12 environment (torch 2.14, transformers 4.56): under torch 2.11 + transformers 5.5 the output degenerates into repeated `!` and the server prints a warning. The engine decodes greedily, so `temperature`/`top_p` are accepted by the API but ignored. The API also supports tool calling: pass OpenAI-style `tools` and the model's call comes back as `tool_calls` with `finish_reason: "tool_calls"` (Hermes/Qwen `<tool_call>` blocks and Llama-style JSON replies are parsed; `tool_choice: "none"` disables it; streaming holds back the call text and sends it as one `tool_calls` delta); send tool results back as `role: "tool"` messages. See `utils/tool_calls.py`. Follow-up messages reuse the KV blocks of earlier turns through the engine's prefix cache. Run `tests/test_server.py` for the API tests (they use a stub engine).
 
 ## Supported models
 
