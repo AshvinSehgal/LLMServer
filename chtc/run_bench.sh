@@ -69,7 +69,7 @@ export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
 
 if [ "${SKIP_PIP:-0}" != "1" ]; then
   # torch 2.5.1 / Triton come from the image; transformers 4.56.1 is the version the engine was developed against
-  pip install --user -q "transformers==4.56.1" pytest numpy >> "$RESULTS/pip.txt" 2>&1 || note "WARNING: pip install of transformers/pytest failed (see pip.txt)"
+  pip install --user -q "transformers==4.56.1" "huggingface_hub>=0.34,<1.0" pytest numpy sentencepiece protobuf >> "$RESULTS/pip.txt" 2>&1 || note "WARNING: pip install of transformers/pytest failed (see pip.txt)"
 fi
 
 python - > "$RESULTS/versions.txt" 2>&1 <<'PYEOF'
@@ -152,7 +152,7 @@ if [ "${GEMM:-0}" = "1" ]; then
   python bench_gemm.py --model "$MODEL" > "$RESULTS/gemm_bench.txt" 2>&1 || note "WARNING: bench_gemm.py failed; see gemm_bench.txt"
 fi
 if [ "${QUALITY:-0}" = "1" ]; then
-  pip install --user -q datasets >> "$RESULTS/pip.txt" 2>&1 || note "WARNING: pip install datasets failed (see pip.txt)"
+  pip install --user -q datasets "huggingface_hub>=0.34,<1.0" "transformers==4.56.1" >> "$RESULTS/pip.txt" 2>&1 || note "WARNING: pip install datasets failed (see pip.txt)"
   python eval_quality.py --model "$MODEL" --windows "${QUALITY_WINDOWS:-40}" > "$RESULTS/quality.txt" 2>&1 || note "WARNING: eval_quality.py failed; see quality.txt"
   note "quality:"; grep -v "Loading\|Fetching\|Warning\|deprecated\|tokenizers\|TOKENIZERS\|Avoid\|Explicitly\|To disable" "$RESULTS/quality.txt" | tee -a "$STATUS"
 fi

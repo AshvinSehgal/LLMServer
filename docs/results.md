@@ -55,14 +55,21 @@ At batch 32 with 1024-token contexts the attention kernel change alone took the 
 - Triton kernels cannot be compiled on a laptop, so every new kernel needs a CUDA test that runs in the next job. One dummy pointer argument that was only used on a dead constexpr branch still failed type checking and took every custom run down.
 - Profile before optimizing: the 105 ms first-token time for 32 x 128-token prompts was 70% launch overhead (thousands of per-request launches), not GPU work.
 
-## Experiments prepared but not yet run
+## Experiments run on 2026-11-14 (code v9.29)
 
-Each is a CHTC job; `STATUS.txt` in the returned tarball summarizes the result.
+**Model families** (`chtc/bench_families.sub`, H200, bf16, decode tok/s vs vLLM). Llama 3.1 8B: 1.04x / 1.04x / 0.94x at 128 tokens (batch 1/8/32) and 1.04x / 1.04x / 0.88x at 1024 tokens, and greedy output identical to Hugging Face in every cell and in the float32 check. Qwen2.5-7B: 1.03x / 1.06x / 1.03x and 1.03x / 1.05x / 0.94x. The batch-32 gap is the same one the Qwen3 8B/14B show. On Qwen2.5-7B neither vLLM nor this engine matches Hugging Face bf16 in any request (agreement 0.00 for both), yet float32 re-scoring of each first divergence prefers this engine's token in 41 of 41 cases (logit gaps 0.29 to 0.45), so Hugging Face's bf16 path is the less accurate one there. Mistral 7B did not run: the tokenizer needs `sentencepiece`, now installed by the job.
 
-| job | question |
-|---|---|
-| `chtc/bench_spec.sub` | How much does greedy speculative decoding (Qwen3-0.6B/1.7B drafting for the 8B and 14B) speed up batch-1 decode, and does vLLM's draft-model support match it? |
-| `chtc/bench_quant.sub` | What does the CUDA int8 weight-only kernel (`utils/quant_kernels.py`) buy at 8B/14B, what does it cost in WikiText-2 perplexity, and does a Triton kernel beat cuBLAS bf16 at 32 rows (`bench_gemm.py`)? |
-| `chtc/bench_serve.sub` | Throughput and p50/p90/p99 TTFT and TPOT under Poisson arrivals with a shared system prompt: `server.py` vs `vllm serve`. |
-| `chtc/bench_long.sub` | Speed at 4k, 16k and 32k-token prompts (the paged path now keeps contexts up to 40k on the fast path by lengthening its attention slices). |
-| `chtc/bench_families.sub` | Speed and correctness of Qwen2.5-7B, Llama 3.1 8B and Mistral 7B v0.3. |
+**Long context** (`chtc/bench_long.sub`, decode tok/s vs vLLM). 1.7B / 8B at batch 1: 1.07x / 1.00x at 4096, 1.11x / 1.01x at 16384, 1.06x / 1.01x at 32000. At batch 4 the fast path holds at 4096 and 32000 (1.06x / 1.04x and 0.89x / 0.93x). Greedy agreement is 1.00 everywhere. Two problems:
+
+- Prefill of 32000-token prompts is slow: 1.24 s (1.7B) and 3.4 s (8B) at batch 1, against vLLM's 0.37 s and 1.26 s (0.30x and 0.37x); 16384-token prompts are at 0.69x to 0.79x. The 32000 case is chunked at `max_num_batched_tokens` = 16384, and its second chunk (a chunk resuming after a cached prefix) takes the ragged-gather + masked-SDPA path, which cannot use the flash kernel. At batch 4 the four prompts are chunked and interleaved one at a time (11 prefill steps, 16.4 s on the 8B vs vLLM's 5.1 s).
+- Batch-4 decode at 16384 tokens is 0.44x (1.7B) and 0.52x (8B) of vLLM, at 9.8 and 15.5 ms per step against 2.6 and 6.1 ms at batch 1, while the same batch at 32000 tokens is normal. Not explained yet.
+
+**Serving load test** (`chtc/bench_serve.sub`, open-loop Poisson arrivals, `server.py` vs `vllm serve`). Median time to first token is the same at moderate load (1.7B at 16 req/s: 32 ms vs 22 ms; 8B at 8 req/s: 45 ms vs 28 ms) and 2x lower under a burst of 96 requests (1.7B: 812 ms vs 1612 ms; 8B: 1222 ms vs 2073 ms). Inter-token latency is the weak spot: the median matches vLLM at low load but the 99th percentile is 3x to 4x worse (1.7B at 4 req/s: 11.0 ms vs 2.9 ms), because a decode step waits behind any prefill chunk scheduled in the same step. Tokens per second and end-to-end latency are not comparable between the two: the engine's responses average about 80 tokens and vLLM's 128 for the same `max_tokens`, which is not yet explained, so compare only the latency percentiles.
+
+**Speculative decoding** (`chtc/bench_spec.sub`, batch 1, 128 tokens, Qwen3-0.6B/1.7B drafting for the 8B/14B). The result is negative: speculation is 0.2x to 0.5x of plain decoding (8B with the 0.6B draft: 50 tok/s at k=3 vs 160 plain; 14B with the 1.7B draft: 52.5 vs 103). Acceptance is decent (0.5 to 0.67 at k=3, 2.8 to 3.0 tokens per round), and the output was identical to plain decoding for 6 or 7 of 8 prompts (the rest are bf16 near-ties). The cause is cost per round, not acceptance: `utils/speculative.py` runs the draft and the verification through the eager prefill-style forward, which is launch-bound at roughly 20 ms per forward, while plain decode is a CUDA graph at about 6 ms per step. vLLM 0.11 does not support draft-model speculation, so there is no comparison.
+
+**int8 weight-only kernel** (`chtc/bench_quant.sub`, `bench_gemm.py` at 8B and 14B shapes, 1/8/32 rows). The Triton int8 kernel is faster than the old dequantize fallback by 5x to 14x but slower than cuBLAS bf16 for most projections: it reads half the bytes yet reaches only 0.8 to 2.1 TB/s against cuBLAS's 2.3 to 3.9 TB/s. It wins only for `gate_up` at 1 to 8 rows (46.6 vs 52.3 us on the 8B) and `lm_head` (236 vs 306 us); `down` (K=12288) is 1.6x to 2x slower. Summed over one 8B layer it is about 0.85x of bf16, so int8 is a memory saving here, not a speed-up. Narrow outputs (N=4096 gives only 128 programs on 132 SMs, each streaming a long K) probably need split-K. The perplexity and end-to-end int8 runs failed (a `datasets` install pulled in a huggingface-hub that `transformers` rejects); the job now pins it.
+
+## Experiments still to run
+
+Re-run `chtc/bench_quant.sub`, `chtc/bench_families.sub` (Mistral only) after the pip fixes.
