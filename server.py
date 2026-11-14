@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from utils.tool_calls import ToolCallStream, parse_tool_calls, to_template_messages
 from utils.engine import Engine, STREAM_END
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -49,7 +50,10 @@ MODEL_CATALOG = [
 
 class Message(BaseModel):
     role: str
-    content: str
+    content: str | None = None  # an assistant message that only calls tools has no text
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class SwitchRequest(BaseModel):
@@ -64,6 +68,8 @@ class ChatRequest(BaseModel):
     temperature: float | None = None  # accepted, ignored (greedy decoding)
     top_p: float | None = None  # accepted, ignored
     enable_thinking: bool = False  # Qwen3: let the model reason inside <think> before answering
+    tools: list[dict] | None = None  # OpenAI function definitions; the model may answer with tool_calls
+    tool_choice: str | dict | None = None  # "none" suppresses tools; anything else behaves as "auto"
 
 
 class ChatService:
@@ -134,18 +140,22 @@ class ChatService:
         if self.runner is None or self.runner.done():
             self.runner = asyncio.create_task(self.engine.run())
 
-    def build_prompt_ids(self, messages, enable_thinking):
-        chat = [{"role": message.role, "content": message.content} for message in messages]
+    def build_prompt_ids(self, messages, enable_thinking, tools=None):
+        if tools or any(message.tool_calls or message.role == "tool" for message in messages):
+            chat = to_template_messages(messages)
+        else:
+            chat = [{"role": message.role, "content": message.content or ""} for message in messages]
+        extra = {"tools": tools} if tools else {}
         try:
-            text = self.tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
+            text = self.tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking, **extra)
         except TypeError:  # templates without the flag
-            text = self.tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+            text = self.tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, **extra)
         return self.tokenizer(text, add_special_tokens=False)["input_ids"]
 
     def submit(self, body):
         if self.loading is not None or self.engine is None:
             raise HTTPException(503, f"Loading {self.loading or 'a model'}; try again in a moment.")
-        prompt_ids = self.build_prompt_ids(body.messages, body.enable_thinking)
+        prompt_ids = self.build_prompt_ids(body.messages, body.enable_thinking, body.tools if body.tool_choice != "none" else None)
         limit = min(body.max_tokens or self.engine.max_new_tokens, self.engine.max_new_tokens)
         if len(prompt_ids) + 1 > self.max_context:
             raise HTTPException(400, f"Conversation is {len(prompt_ids)} tokens; the server's context limit is {self.max_context}. Start a new chat.")
@@ -217,7 +227,11 @@ def create_app(service):
         created = int(time.time())
         started = time.perf_counter()
 
-        def finish_reason():
+        use_tools = bool(body.tools) and body.tool_choice != "none"
+
+        def finish_reason(calls=()):
+            if calls:
+                return "tool_calls"
             reason = request.finish_reason.value if request.finish_reason is not None else None
             return {"eos": "stop", "length": "length"}.get(reason, reason or "stop")
 
@@ -236,21 +250,40 @@ def create_app(service):
                     parts.append(piece)
             finally:
                 service.release(request)
+            text, calls = parse_tool_calls("".join(parts)) if use_tools else ("".join(parts), [])
+            message = {"role": "assistant", "content": text if text or not calls else None}
+            if calls:
+                message["tool_calls"] = calls
             return JSONResponse({"id": completion_id, "object": "chat.completion", "created": created, "model": service.model_name,
-                                 "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(parts)}, "finish_reason": finish_reason()}],
+                                 "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(calls)}],
                                  "usage": usage(first_token_at)})
 
         async def stream():
             first_token_at = None
+            holdback = ToolCallStream() if use_tools else None
+
+            def delta_chunk(delta, reason=None, with_usage=False):
+                payload = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": service.model_name,
+                           "choices": [{"index": 0, "delta": delta, "finish_reason": reason}]}
+                if with_usage:
+                    payload["usage"] = usage(first_token_at)
+                return sse(payload)
+
             try:
-                yield sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": service.model_name,
-                           "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+                yield delta_chunk({"role": "assistant"})
                 async for piece in service.chunks(request):
                     first_token_at = first_token_at if first_token_at is not None else time.perf_counter() - started
-                    yield sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": service.model_name,
-                               "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
-                yield sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": service.model_name,
-                           "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason()}], "usage": usage(first_token_at)})
+                    text = holdback.feed(piece) if holdback is not None else piece
+                    if text:
+                        yield delta_chunk({"content": text})
+                calls = []
+                if holdback is not None:
+                    rest, calls = holdback.finish()
+                    if rest:
+                        yield delta_chunk({"content": rest})
+                    for index, call in enumerate(calls):
+                        yield delta_chunk({"tool_calls": [{"index": index, **call}]})
+                yield delta_chunk({}, finish_reason(calls), with_usage=True)
                 yield "data: [DONE]\n\n"
             finally:
                 service.release(request)  # also runs on client disconnect

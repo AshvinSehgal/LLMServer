@@ -11,8 +11,9 @@ from utils.request import RequestFinishReason
 
 
 class FakeTokenizer:
-    def apply_chat_template(self, chat, tokenize, add_generation_prompt, enable_thinking=None):
+    def apply_chat_template(self, chat, tokenize, add_generation_prompt, enable_thinking=None, tools=None):
         self.last = (chat, enable_thinking)
+        self.last_tools = tools
         return " ".join(m["content"] for m in chat)
 
     def __call__(self, text, add_special_tokens=False):
@@ -175,3 +176,44 @@ def test_requests_release_their_slot_so_switching_works_afterwards():
     client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
     assert service.active == 0
     assert client.post("/api/model", json={"id": "Qwen/Qwen3-4B"}).status_code == 200
+
+
+TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+CALL_PIECES = ("Checking. <tool", "_call>", '{"name": "get_weather", ', '"arguments": {"city": "Oslo"}}', "</tool_call>")
+
+
+def test_tool_call_in_non_streaming_response():
+    engine, tokenizer = FakeEngine(CALL_PIECES), FakeTokenizer()
+    client = TestClient(create_app(ChatService(engine, tokenizer, "fake-model", max_context=50)))
+    body = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "weather in Oslo?"}], "tools": TOOLS}).json()
+    choice = body["choices"][0]
+    assert tokenizer.last_tools == TOOLS
+    assert choice["finish_reason"] == "tool_calls" and choice["message"]["content"] == "Checking."
+    call = choice["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "get_weather" and json.loads(call["function"]["arguments"]) == {"city": "Oslo"}
+
+
+def test_tool_call_in_streaming_response_holds_back_the_tag():
+    engine, tokenizer = FakeEngine(CALL_PIECES), FakeTokenizer()
+    client = TestClient(create_app(ChatService(engine, tokenizer, "fake-model", max_context=50)))
+    with client.stream("POST", "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}], "tools": TOOLS, "stream": True}) as response:
+        events = [line[6:] for line in response.iter_lines() if line.startswith("data: ")]
+    payloads = [json.loads(event) for event in events[:-1]]
+    text = "".join(p["choices"][0]["delta"].get("content", "") for p in payloads)
+    assert text == "Checking. " and "<tool" not in text
+    calls = [c for p in payloads for c in p["choices"][0]["delta"].get("tool_calls", [])]
+    assert len(calls) == 1 and calls[0]["index"] == 0 and calls[0]["function"]["name"] == "get_weather"
+    assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_tool_choice_none_ignores_tools_and_tool_messages_reach_the_template():
+    engine, tokenizer = FakeEngine(CALL_PIECES), FakeTokenizer()
+    client = TestClient(create_app(ChatService(engine, tokenizer, "fake-model", max_context=80)))
+    messages = [{"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Oslo\"}"}}]},
+                {"role": "tool", "content": "3 degrees", "tool_call_id": "c1"}]
+    body = client.post("/v1/chat/completions", json={"messages": messages, "tools": TOOLS, "tool_choice": "none"}).json()
+    assert tokenizer.last_tools is None
+    assert "tool_calls" not in body["choices"][0]["message"] and "<tool_call>" in body["choices"][0]["message"]["content"]
+    chat = tokenizer.last[0]
+    assert chat[1]["tool_calls"][0]["function"]["arguments"] == {"city": "Oslo"} and chat[2]["role"] == "tool"
