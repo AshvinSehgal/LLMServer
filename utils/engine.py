@@ -140,6 +140,8 @@ class Engine:
         # Small fixed slices keep many programs busy even for short contexts (idle slices exit immediately); the slice
         # count bounds the longest context the graph can serve.
         tokens_per_split = -(-MIN_TOKENS_PER_SPLIT // tile) * tile
+        if -(-coverage // tokens_per_split) > MAX_SPLITS:
+            tokens_per_split = -(-(-(-coverage // MAX_SPLITS)) // tile) * tile  # very long contexts: fewer, longer slices instead of falling off the fast path
         num_splits = min(MAX_SPLITS, next_power_of_two(-(-coverage // tokens_per_split)))
         self.kv_cache.paged_num_splits = num_splits
         self.kv_cache.paged_tokens_per_split = tokens_per_split

@@ -1,0 +1,37 @@
+# Other model families on one H200: Qwen2.5 (Qwen2 architecture, QKV biases), Llama 3.1 (llama3 rope scaling) and Mistral 7B v0.3.
+# The Llama and Mistral weights come from ungated mirrors so no Hugging Face token is needed. Submit from the repo root:  condor_submit chtc/bench_families.sub
+# Each job writes llmserver_results_<tag>.tar.gz next to where you submitted. Check "code version" in STATUS.txt.
+universe                = docker
+docker_image            = pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
+
+executable              = chtc/run_bench.sh
+arguments               = --prompt-tokens 128,1024 --batch-sizes 1,8,32 --output-tokens 128 --repeats 3 --dtype bfloat16
+# Tests already run on the 1.7B job; the ablation variants (no graphs / old kernels) and the 1.7B-shaped attention microbenchmark add time without new information here.
+environment             = "MODEL_ID=$(model) BACKENDS=hf,custom,vllm RUN_TESTS=0 PROFILE=1 ABLATE=0 ATTN_BENCH=0 AGREEMENT=$(agreement)"
+
+transfer_input_files    = utils, tests, benchmark.py, benchmark_cuda.py, agreement_check.py, bench_attention.py, bench_prompts.py, bench_spec.py, bench_spec_vllm.py, bench_gemm.py, eval_quality.py, serve_bench.py, server.py, web, VERSION
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+transfer_output_files   = llmserver_results.tar.gz
+transfer_output_remaps  = "llmserver_results.tar.gz = llmserver_results_$(tag).tar.gz"
+
+log                     = chtc/bench_families_$(tag)_$(Cluster).log
+output                  = chtc/bench_families_$(tag)_$(Cluster).out
+error                   = chtc/bench_families_$(tag)_$(Cluster).err
+
+request_gpus            = 1
+request_cpus            = 4
+request_memory          = 64GB
+request_disk            = 100GB
++WantGPULab             = true
++GPUJobLength           = "short"
+# Same GPU model as the 1.7B runs so the numbers are comparable across model sizes.
+require_gpus = (Capability == 9.0) && regexp("H200", DeviceName)
+gpus_minimum_memory     = 80000
+
+# tag, model, agreement check (a float32 copy plus two bf16 copies of a 7-8B model fit in 141 GB)
+queue tag, model, agreement from (
+  qwen25-7b,   Qwen/Qwen2.5-7B-Instruct,             1
+  llama31-8b,  unsloth/Meta-Llama-3.1-8B-Instruct,   1
+  mistral-7b,  unsloth/mistral-7b-instruct-v0.3,     1
+)
