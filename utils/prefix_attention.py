@@ -49,6 +49,22 @@ def causal_attention(q, new_keys, new_values, group_size, scale):
     return F.scaled_dot_product_attention(q, new_keys.unsqueeze(0), new_values.unsqueeze(0), dropout_p=0.0, scale=scale, is_causal=True, enable_gqa=True)
 
 
+def warmup(device, dtype, n_heads, head_dim, max_length, scale):
+    """Build cuDNN's plan for every length bucket a fresh prompt can pad to (about 0.5 s each, the first time a shape is seen), so no request pays for it.
+    Returns the number of shapes warmed."""
+    dummy = torch.empty(1, n_heads, MIN_LENGTH_FOR_CUDNN, head_dim, device=device, dtype=dtype)
+    if not _cudnn_usable(dummy):
+        return 0
+    count = 0
+    for length in range(-(-MIN_LENGTH_FOR_CUDNN // LENGTH_BUCKET) * LENGTH_BUCKET, min(max_length, 1 << 20) + 1, LENGTH_BUCKET):
+        tensor = torch.zeros(1, n_heads, length, head_dim, device=device, dtype=dtype)
+        causal_attention(tensor, tensor[0, :1], tensor[0, :1], n_heads, scale)
+        count += 1
+    torch.cuda.synchronize()
+    del tensor
+    return count
+
+
 def attention_with_lse(q, k, v, scale, causal):
     """q [B, H, Lq, D], k and v [B, H, Lk, D] -> (output like q, log-sum-exp float32 [B, H, Lq])."""
     global _FLASH_BROKEN, _CUDNN_LSE_BROKEN

@@ -99,3 +99,9 @@ def test_cudnn_log_sum_exp_matches_the_reference_on_cuda(causal, monkeypatch):
         scores = scores.masked_fill(torch.ones(3000, 3000, dtype=torch.bool, device="cuda").triu(1), float("-inf"))
     assert (lse - torch.logsumexp(scores, dim=-1)).abs().max().item() < 0.02
     assert (output.float() - F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=128 ** -0.5).float()).abs().max().item() < 0.02
+
+
+def test_warmup_does_nothing_without_cuda():
+    if torch.cuda.is_available():
+        pytest.skip("CPU behaviour")
+    assert prefix_attention.warmup(torch.device("cpu"), torch.float32, 4, 16, 8192, 0.25) == 0

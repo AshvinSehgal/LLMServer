@@ -17,6 +17,7 @@ from utils.batch import PrefillBatch, PackedPrefillBatch, DecodeBatch
 from utils.kv_cache import PagedKVCache, KVCacheExhaustedError
 from utils.paged_attention import triton_attention_usable, paged_split_plan, DEFAULT_NUM_SPLITS
 from utils.cuda_graph import CudaGraphDecodeRunner
+from utils import prefix_attention
 from utils.fused_ops import fused_ops_usable
 from utils.speculative import SpeculativeDecoder
 
@@ -80,6 +81,8 @@ class Engine:
             device=self.device,
             dtype=self.dtype
         )
+        if self.device.type == "cuda" and self.model.config.num_attention_heads % config.num_key_value_heads == 0:
+            prefix_attention.warmup(self.device, self.dtype, config.num_attention_heads, head_dim, min(max_num_batched_tokens, self.num_blocks * self.block_size), head_dim ** -0.5)
         self.setup_paged_decode(paged_decode, cuda_graphs, paged_context_limit, max(max_batch_size, num_draft_tokens + 1 if draft_model is not None else 0))
         self.speculator = SpeculativeDecoder(self, draft_model, num_draft_tokens) if draft_model is not None else None
         if self.model.generation_config.bos_token_id is not None:
