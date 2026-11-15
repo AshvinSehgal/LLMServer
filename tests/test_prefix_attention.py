@@ -92,7 +92,7 @@ def test_cudnn_log_sum_exp_matches_the_reference_on_cuda(causal):
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 4, 3000, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
     output, lse = attention_with_lse(q, k, v, 128 ** -0.5, causal)
-    assert not prefix_attention._CUDNN_BROKEN
+    assert not prefix_attention._CUDNN_LSE_BROKEN
     scores = torch.matmul(q.float(), k.float().mT) * 128 ** -0.5
     if causal:
         scores = scores.masked_fill(torch.ones(3000, 3000, dtype=torch.bool, device="cuda").triu(1), float("-inf"))

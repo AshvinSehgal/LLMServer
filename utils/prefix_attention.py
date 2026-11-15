@@ -19,7 +19,8 @@ MIN_CONTEXT_FOR_SPLIT = 4096  # below this the masked kernel is fast enough, and
 MIN_LENGTH_FOR_CUDNN = 2048   # the cuDNN kernel is about 1.8x faster than flash on H200 from 4096 tokens up, and no better at 1024
 USE_CUDNN = True
 _FLASH_BROKEN = False
-_CUDNN_BROKEN = False
+_CUDNN_BROKEN = False      # the plain cuDNN call failed
+_CUDNN_LSE_BROKEN = False  # the log-sum-exp operator failed (kept separate: the plain call may still work)
 
 
 def _cudnn_usable(q):
@@ -45,15 +46,19 @@ def causal_attention(q, new_keys, new_values, group_size, scale):
 
 def attention_with_lse(q, k, v, scale, causal):
     """q [B, H, Lq, D], k and v [B, H, Lk, D] -> (output like q, log-sum-exp float32 [B, H, Lq])."""
-    global _FLASH_BROKEN, _CUDNN_BROKEN
-    if _cudnn_usable(q):
-        try:  # PyTorch 2.5 signature: (q, k, v, compute_log_sumexp, dropout_p, is_causal, return_debug_mask, *, scale)
-            output, lse = torch.ops.aten._scaled_dot_product_cudnn_attention(q, k, v, True, 0.0, causal, False, scale=scale)[:2]
+    global _FLASH_BROKEN, _CUDNN_LSE_BROKEN
+    if _cudnn_usable(q) and not _CUDNN_LSE_BROKEN:
+        try:  # PyTorch 2.5.1: (q, k, v, attn_bias, compute_log_sumexp, dropout_p, is_causal, return_debug_mask, *, scale); older builds lack attn_bias
+            try:
+                result = torch.ops.aten._scaled_dot_product_cudnn_attention(q, k, v, None, True, 0.0, causal, False, scale=scale)
+            except RuntimeError:
+                result = torch.ops.aten._scaled_dot_product_cudnn_attention(q, k, v, True, 0.0, causal, False, scale=scale)
+            output, lse = result[:2]
             if lse.numel() != q.shape[0] * q.shape[1] * q.shape[2]:
                 raise RuntimeError(f"unexpected log-sum-exp shape {tuple(lse.shape)}")
             return output, lse.reshape(q.shape[:3]).float()
         except Exception as error:
-            _CUDNN_BROKEN = True
+            _CUDNN_LSE_BROKEN = True
             warnings.warn(f"cuDNN attention with log-sum-exp unavailable ({error!r}); using flash")
     if q.is_cuda and q.dtype in (torch.bfloat16, torch.float16) and q.shape[-1] % 8 == 0 and q.shape[-1] <= 256 and not _FLASH_BROKEN:
         try:
