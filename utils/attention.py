@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from utils.layers import RMSNorm, apply_rotary_embedding
 from utils.fused_ops import qkv_norm_rotary_write, qk_norm_rotary
 from utils.paged_attention import paged_decode_attention, DEFAULT_NUM_SPLITS
+from utils import prefix_attention
 
 def joint_rotary(qk, cosine, signed_sine):
     """Rotate stacked Q/K heads ([batch, seq, heads, head_dim]) in one pass (models without Q/K normalization)."""
@@ -272,6 +273,10 @@ class SelfAttention(nn.Module):
                             # First chunk: the keys are exactly this call's keys, so skip the cache read-back,
                             # the KV-head duplication and the explicit mask (padding rows are sliced away).
                             request_attention_scores = F.scaled_dot_product_attention(request_q, new_keys.unsqueeze(0), new_values.unsqueeze(0), dropout_p=0.0, scale=self.attention_scaling, is_causal=True, enable_gqa=True)
+                        elif request_start_pos > 0 and request_end_pos >= prefix_attention.MIN_CONTEXT_FOR_SPLIT and self.use_sdpa:
+                            # A chunk resuming after a long prefix: flash attention over the prefix and over the chunk, merged (no dense mask).
+                            prefix_keys, prefix_values = kv_cache.get(layer_index, request_block_table, request_start_pos)
+                            request_attention_scores = prefix_attention.chunk_attention(request_q, new_keys, new_values, prefix_keys, prefix_values, group_size, self.attention_scaling)
                         else:
                             cached_keys, cached_values = kv_cache.get(layer_index, request_block_table, request_end_pos)
                             cached_keys = cached_keys.unsqueeze(0)

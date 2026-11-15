@@ -9,7 +9,7 @@
 #   RUN_TESTS    1 = run the GPU unit tests first                        (default 1)
 #   PROFILE      1 = write a kernel profile of the custom engine         (default 1)
 #   ABLATE       1 = also run custom without graphs / without the kernel (default 1)
-#   MODE         bench (default), spec or serve (load test of server.py vs vllm serve; RATES, SERVE_REQUESTS)
+#   MODE         bench (default), spec, diag (per-step long-context decode timing) or serve (load test of server.py vs vllm serve; RATES, SERVE_REQUESTS)
 #                spec: (speculative decoding; needs DRAFT_ID, optional DRAFT_TOKENS, NEW_TOKENS)
 #   GEMM         1 = run bench_gemm.py (int8 / bf16 matmul kernels)        (default 0)
 #   QUALITY      1 = run eval_quality.py (WikiText-2 perplexity)           (default 0)
@@ -182,6 +182,13 @@ if [ "${MODE:-bench}" = "serve" ]; then
   if [ -n "$VLLM_PYTHON" ]; then
     serve_one vllm 18001 "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server --model "$MODEL" --served-model-name "$MODEL_ID" --dtype bfloat16 --max-model-len 4096 --max-num-seqs 32 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.85 --host 127.0.0.1 --port 18001
   fi
+  exit 0
+fi
+
+if [ "${MODE:-bench}" = "diag" ]; then
+  # Per-step decode timing for long contexts (diag_long_decode.py): which path each step took and how long it took.
+  python diag_long_decode.py --model "$MODEL" --prompt-tokens "${DIAG_PROMPT_TOKENS:-16384}" --batch "${DIAG_BATCH:-4}" > "$RESULTS/diag_decode.txt" 2>&1 || note "WARNING: diag_long_decode.py failed; see diag_decode.txt"
+  grep -v "Fetching\|Loading\|Warning\|deprecated" "$RESULTS/diag_decode.txt" | tee -a "$STATUS"
   exit 0
 fi
 
