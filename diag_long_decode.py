@@ -20,7 +20,7 @@ from utils.engine import Engine
 from utils.model_loader import model_loader
 
 
-def run_variant(model, tokenizer, args, label, kernel=None, tokens_per_split=None, tag="x"):
+def run_variant(model, tokenizer, args, label, kernel=None, tokens_per_split=None, tag="x", batched_tokens=None):
     if kernel:
         os.environ["LLMSERVER_ATTENTION_KERNEL"] = kernel
     else:
@@ -28,11 +28,26 @@ def run_variant(model, tokenizer, args, label, kernel=None, tokens_per_split=Non
     prompts = build_prompts(tokenizer, args.prompt_tokens, args.batch, f"diag-{label}-{tag}")
     longest = args.prompt_tokens + args.new_tokens
     blocks = args.batch * math.ceil(longest / 16) + 8
-    engine = Engine(model, tokenizer, max_new_tokens=args.new_tokens, max_batch_size=args.batch, max_num_batched_tokens=args.max_num_batched_tokens, kv_cache_num_blocks=blocks,
+    engine = Engine(model, tokenizer, max_new_tokens=args.new_tokens, max_batch_size=args.batch, max_num_batched_tokens=batched_tokens or args.max_num_batched_tokens, kv_cache_num_blocks=blocks,
                     kv_cache_block_size=16, stream_text=False, max_completed_requests=0, ignore_eos=True, paged_context_limit=max(8192, longest))
     if tokens_per_split:
+        needed = -(-longest // tokens_per_split)
+        if needed > 64:
+            print(f"{label}: skipped ({needed} slices of {tokens_per_split} tokens exceed the 64-slice limit)")
+            return
         engine.kv_cache.paged_tokens_per_split = tokens_per_split
-        engine.kv_cache.paged_num_splits = min(64, -(-longest // tokens_per_split))
+        engine.kv_cache.paged_num_splits = 1 << (needed - 1).bit_length()
+        engine.paged_context_limit = engine.kv_cache.paged_num_splits * tokens_per_split
+    prefill_trace = []
+    original_prefill = engine.process_prefill_work
+    def traced(prefill_work, packed=False):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        result = original_prefill(prefill_work, packed=packed)
+        torch.cuda.synchronize()
+        prefill_trace.append((len(prefill_work), sorted({chunk for _, chunk in prefill_work}), sorted({r.num_computed_tokens for r, _ in prefill_work}), time.perf_counter() - start))
+        return result
+    engine.process_prefill_work = traced
     fallbacks = []
     original = engine.run_paged_decode
     def timed(requests):
@@ -54,6 +69,7 @@ def run_variant(model, tokenizer, args, label, kernel=None, tokens_per_split=Non
     total = steps[-1]
     first_decode = None
     print(f"{label}: total {total:.2f} s | slices {engine.kv_cache.paged_num_splits} x {engine.kv_cache.paged_tokens_per_split} tokens | paged limit {engine.paged_context_limit} | graph {engine.graph_runner is not None}")
+    print(f"    prefill passes (requests, chunk lengths, start positions, seconds): " + "; ".join(f"({n}, {c}, {st}, {sec:.2f})" for n, c, st, sec in prefill_trace))
     by_rows = {}
     for rows, seconds, fell in timed.log:
         by_rows.setdefault(rows, []).append((seconds, fell))
@@ -80,6 +96,7 @@ def main():
     run_variant(model, tokenizer, args, "256-token slices", tokens_per_split=256, tag="a")
     run_variant(model, tokenizer, args, "512-token slices", tokens_per_split=512, tag="b")
     run_variant(model, tokenizer, args, "broadcast kernel", kernel="broadcast", tag="c")
+    run_variant(model, tokenizer, args, "4x token budget", batched_tokens=4 * args.max_num_batched_tokens, tag="e")
 
 
 if __name__ == "__main__":

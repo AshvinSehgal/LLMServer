@@ -189,6 +189,8 @@ if [ "${MODE:-bench}" = "diag" ]; then
   # Per-step decode timing for long contexts (diag_long_decode.py): which path each step took and how long it took.
   python diag_long_decode.py --model "$MODEL" --prompt-tokens "${DIAG_PROMPT_TOKENS:-16384}" --batch "${DIAG_BATCH:-4}" > "$RESULTS/diag_decode.txt" 2>&1 || note "WARNING: diag_long_decode.py failed; see diag_decode.txt"
   grep -v "Fetching\|Loading\|Warning\|deprecated" "$RESULTS/diag_decode.txt" | tee -a "$STATUS"
+  python bench_prefill_attention.py --model "$MODEL" > "$RESULTS/prefill_attention.txt" 2>&1 || note "WARNING: bench_prefill_attention.py failed; see prefill_attention.txt"
+  cat "$RESULTS/prefill_attention.txt" | tee -a "$STATUS"
   exit 0
 fi
 
