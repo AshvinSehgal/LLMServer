@@ -65,8 +65,9 @@ MAX_SPLIT_K = 8
 
 
 def default_config(n, rows):
-    """(block_n, block_k) from the H200 sweep: wide outputs want 64 columns per program, narrow ones 32 columns and longer K steps."""
-    return (64, 128) if n >= 16384 else (32, 256)
+    """(block_n, block_k). The split-K sweep on an H200 (8B and 14B shapes, 1 to 32 rows) picked 64 x 128 for every projection once
+    narrow outputs are split along K; the 32 x 256 default used before split-K left them at 0.7 to 1.1 TB/s."""
+    return 64, 128
 
 
 def auto_split_k(n, k, rows, block_n, block_k):

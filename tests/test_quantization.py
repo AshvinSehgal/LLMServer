@@ -253,9 +253,9 @@ def test_w8a16_split_k_matches_and_is_deterministic(rows, split_k):
 
 def test_auto_split_k_targets_narrow_outputs_only():
     from utils.quant_kernels import auto_split_k
-    assert auto_split_k(4096, 12288, 1, 32, 256) == 4 and auto_split_k(4096, 4096, 8, 32, 256) == 4  # narrow output: split
+    assert auto_split_k(4096, 12288, 1, 64, 128) == 8 and auto_split_k(4096, 4096, 8, 64, 128) == 8 and auto_split_k(6144, 4096, 1, 64, 128) == 4  # narrow output: split
     assert auto_split_k(24576, 4096, 1, 64, 128) == 1 and auto_split_k(151936, 4096, 1, 64, 128) == 1  # wide output: already enough programs
-    assert auto_split_k(4096, 256, 1, 32, 256) == 1  # too little K to split
+    assert auto_split_k(4096, 256, 1, 64, 128) == 1  # too little K to split
 
 
 def test_int8_linear_unchanged_off_cuda():

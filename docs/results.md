@@ -70,11 +70,20 @@ At batch 32 with 1024-token contexts the attention kernel change alone took the 
 
 **int8 weight-only kernel** (`chtc/bench_quant.sub`, `bench_gemm.py` at 8B and 14B shapes, 1/8/32 rows). The Triton int8 kernel is faster than the old dequantize fallback by 5x to 14x but slower than cuBLAS bf16 for most projections: it reads half the bytes yet reaches only 0.8 to 2.1 TB/s against cuBLAS's 2.3 to 3.9 TB/s. It wins only for `gate_up` at 1 to 8 rows (46.6 vs 52.3 us on the 8B) and `lm_head` (236 vs 306 us); `down` (K=12288) is 1.6x to 2x slower. Summed over one 8B layer it is about 0.85x of bf16, so int8 is a memory saving here, not a speed-up. Narrow outputs (N=4096 gives only 128 programs on 132 SMs, each streaming a long K) probably need split-K. The perplexity and end-to-end int8 runs failed (a `datasets` install pulled in a huggingface-hub that `transformers` rejects); the job now pins it.
 
-## Changes since those results (v9.31, untested on a GPU)
+## Speculative decoding and int8 after the v9.31 changes (H200, code v9.31)
 
-- **Speculative decoding now runs on the graph path.** Each draft step is a graph-replayed single-token decode on the draft's own paged cache, and the target checks the k+1 tokens as a decode batch of k+1 rows sharing one block table (row j: position start+j, context length start+j+1). The fused QKV kernel writes every row's key and value before attention reads them, so each row sees the earlier ones. This uses the same graphs and kernels as ordinary decoding and adds no kernel. The target's graph runner is now sized for at least k+1 rows. The CPU tests check that output equals plain decoding on this path; the speed is the open question for `chtc/bench_spec.sub`. Expected cost per round at k=3: about 4 draft steps (2 ms each for the 0.6B) plus one 4-row target step (about 7 ms for the 8B), so about 15 ms for 2.8 tokens, against 6.3 ms per token plain.
-- **int8 kernel gets split-K** for narrow outputs (`o_proj`, `qkv`, `down`): the K range is split across programs, each writing an fp32 partial, and the partials are summed in a fixed order (deterministic). Block sizes now default from the sweep (64 x 128 for wide outputs, 32 x 256 otherwise). `bench_gemm.py` sweeps split-K and prints the engine's default configuration beside the best one.
+**Speculative decoding** (`chtc/bench_spec.sub`, batch 1, 128 tokens, mean over 8 chat prompts). Running the draft as graph-replayed decode and checking k+1 tokens as a decode batch (see `utils/speculative.py`) turned 0.2x to 0.5x into a speed-up:
+
+| target | draft | plain tok/s | k=3 | k=5 | k=7 |
+|---|---|---|---|---|---|
+| Qwen3-8B | 0.6B | 159.5 | 1.13x | 1.16x | 1.07x |
+| Qwen3-14B | 0.6B | 103.1 | 1.43x | 1.50x | 1.47x |
+| Qwen3-14B | 1.7B | 103.6 | 1.32x | 1.42x | - |
+
+Acceptance is 0.6 at k=3 and falls as k grows, so k=5 is the best setting. The larger target gains more because the draft's cost is a smaller share of each round. Output was identical to plain decoding for 7 of 8 prompts in every run (bf16 near-ties, as in the agreement check). vLLM 0.11 has no draft-model speculation, so there is nothing to compare with.
+
+**int8 weight-only** (`chtc/bench_quant.sub`). Quality is intact: WikiText-2 perplexity on the 8B is 10.961 (Hugging Face bf16), 10.965 (engine bf16) and 10.956 (engine int8); on the 14B 9.834, 9.829 and 9.854. Greedy output equals the bf16 engine's in every request. The int8 weights cut peak GPU memory by a third (8B: 20.5 to 13.7 GB; 14B: 33.3 to 20.8 GB). Decode speed is lower: 0.82x to 0.84x of bf16 on the 8B and 0.71x to 0.76x on the 14B, measured with the first split-K defaults (32 x 256 blocks, which the sweep showed were not the best). In the GEMM sweep, split-K lifted the narrow projections from 0.7 to 1.1 TB/s to 1.0 to 1.6 TB/s: `down` 46 to 31 us (cuBLAS bf16 30 us), `o_proj` 22 to 17 us (cuBLAS 17 us), `qkv` 33 to 21 us (cuBLAS 18 us). The best configuration was 64 x 128 for every projection, and v9.32 makes it the default; summed over a layer at one row the int8 kernel is then about even with cuBLAS bf16 (116 vs 118 us on the 8B), and `lm_head` is 1.3x faster (236 vs 306 us). So int8 is a memory saving at roughly equal speed, not the 2x that halving the bytes suggests: the kernel reaches 1.0 to 2.1 TB/s of the 4.8 TB/s peak, held back by converting int8 to bf16 inside the loop.
 
 ## Experiments still to run
 
-Re-run `chtc/bench_spec.sub` and `chtc/bench_quant.sub` (the quality evaluation and end-to-end int8 never ran), and the Mistral entry of `chtc/bench_families.sub`.
+Re-run `chtc/bench_quant.sub` (v9.32 default configuration) and the Mistral entry of `chtc/bench_families.sub`.
