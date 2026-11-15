@@ -272,7 +272,7 @@ class SelfAttention(nn.Module):
                         if self.use_sdpa and request_start_pos == 0 and SDPA_SUPPORTS_GQA:
                             # First chunk: the keys are exactly this call's keys, so skip the cache read-back,
                             # the KV-head duplication and the explicit mask (padding rows are sliced away).
-                            request_attention_scores = F.scaled_dot_product_attention(request_q, new_keys.unsqueeze(0), new_values.unsqueeze(0), dropout_p=0.0, scale=self.attention_scaling, is_causal=True, enable_gqa=True)
+                            request_attention_scores = prefix_attention.causal_attention(request_q, new_keys, new_values, group_size, self.attention_scaling)
                         elif request_start_pos > 0 and request_end_pos >= prefix_attention.MIN_CONTEXT_FOR_SPLIT and self.use_sdpa:
                             # A chunk resuming after a long prefix: flash attention over the prefix and over the chunk, merged (no dense mask).
                             prefix_keys, prefix_values = kv_cache.get(layer_index, request_block_table, request_start_pos)

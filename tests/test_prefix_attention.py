@@ -70,3 +70,31 @@ def test_chunked_prefill_through_the_split_path_matches_unchunked(monkeypatch):
         outputs.append(request.generated_token_ids)
     assert calls, "the chunked run never used the split path"
     assert outputs[0] == outputs[1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9, reason="Hopper required")
+@pytest.mark.parametrize("group_size", [1, 4])
+@pytest.mark.parametrize("length", [2048, 5000])
+def test_cudnn_causal_attention_matches_flash_on_cuda(group_size, length):
+    torch.manual_seed(0)
+    kv_heads, dim = 4, 128
+    q = torch.randn(1, kv_heads * group_size, length, dim, device="cuda", dtype=torch.bfloat16)
+    keys, values = (torch.randn(kv_heads, length, dim, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    expected = F.scaled_dot_product_attention(q, keys.unsqueeze(0), values.unsqueeze(0), is_causal=True, enable_gqa=True, scale=dim ** -0.5)
+    actual = prefix_attention.causal_attention(q, keys, values, group_size, dim ** -0.5)
+    assert not prefix_attention._CUDNN_BROKEN
+    assert (actual.float() - expected.float()).abs().max().item() < 0.02
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9, reason="Hopper required")
+@pytest.mark.parametrize("causal", [False, True])
+def test_cudnn_log_sum_exp_matches_the_reference_on_cuda(causal):
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 4, 3000, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    output, lse = attention_with_lse(q, k, v, 128 ** -0.5, causal)
+    assert not prefix_attention._CUDNN_BROKEN
+    scores = torch.matmul(q.float(), k.float().mT) * 128 ** -0.5
+    if causal:
+        scores = scores.masked_fill(torch.ones(3000, 3000, dtype=torch.bool, device="cuda").triu(1), float("-inf"))
+    assert (lse - torch.logsumexp(scores, dim=-1)).abs().max().item() < 0.02
+    assert (output.float() - F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=128 ** -0.5).float()).abs().max().item() < 0.02
