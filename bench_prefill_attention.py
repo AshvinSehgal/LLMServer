@@ -58,6 +58,32 @@ def main():
             reference = result if reference is None else reference
             print(f"  {length:6d} {name:9s} {seconds * 1000:8.2f} ms  {flops / seconds / 1e12:6.0f} TFLOP/s  max diff vs first backend {(result.float() - reference.float()).abs().max().item():.4f}")
         del q, k, v, ke, ve
+    chunk_shapes(args)
+
+
+def chunk_shapes(args):
+    """The second chunk of a long prompt: queries [chunk] against a prefix (no mask) and against themselves (causal), merged. The first call
+    at each new shape is timed separately from the repeats: the v9.36 long-context run had a cold first run 4x slower than the second."""
+    from utils import prefix_attention
+    print("split chunk attention, one layer: first call at a new shape / repeat (ms), cudnn vs flash with log-sum-exp")
+    for prefix, chunk in [(16384, 15616), (17152, 14848), (17920, 14080), (18688, 13312), (16384, 16383)]:
+        q = torch.randn(1, args.heads, chunk, args.head_dim, device="cuda", dtype=torch.bfloat16)
+        pk, pv = (torch.randn(1, args.heads, prefix, args.head_dim, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+        ck, cv = (torch.randn(1, args.heads, chunk, args.head_dim, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+        for name, use_cudnn in (("cudnn", True), ("flash", False)):
+            prefix_attention.USE_CUDNN = use_cudnn
+            def call():
+                a = prefix_attention.attention_with_lse(q, pk, pv, args.head_dim ** -0.5, False)
+                b = prefix_attention.attention_with_lse(q, ck, cv, args.head_dim ** -0.5, True)
+                return prefix_attention.merge_attention(a[0], a[1], b[0], b[1])
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            call()
+            torch.cuda.synchronize()
+            first = time.perf_counter() - start
+            print(f"  prefix {prefix:6d} chunk {chunk:6d} {name:6s} first {first * 1000:8.1f}   repeat {timed(call) * 1000:8.2f}")
+    prefix_attention.USE_CUDNN = True
+    print(f"  cudnn fallback flags: plain broken={prefix_attention._CUDNN_BROKEN} lse broken={prefix_attention._CUDNN_LSE_BROKEN}")
 
 
 if __name__ == "__main__":
