@@ -65,13 +65,26 @@ def chunk_shapes(args):
     """The second chunk of a long prompt: queries [chunk] against a prefix (no mask) and against themselves (causal), merged. The first call
     at each new shape is timed separately from the repeats: the v9.36 long-context run had a cold first run 4x slower than the second."""
     from utils import prefix_attention
+    print("fresh causal prompt through prefix_attention.causal_attention, first call at a new length / repeat (ms), cudnn (bucketed) vs the default kernels")
+    for length in (16384, 16383, 15000, 12345, 32000):
+        q = torch.randn(1, args.heads, length, args.head_dim, device="cuda", dtype=torch.bfloat16)
+        k, v = (torch.randn(args.kv_heads, length, args.head_dim, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+        for name, use_cudnn in (("cudnn", True), ("default", False)):
+            prefix_attention.USE_CUDNN = use_cudnn
+            call = lambda: prefix_attention.causal_attention(q, k, v, args.heads // args.kv_heads, args.head_dim ** -0.5)
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            call()
+            torch.cuda.synchronize()
+            first = time.perf_counter() - start
+            print(f"  length {length:6d} {name:8s} first {first * 1000:8.1f}   repeat {timed(call) * 1000:8.2f}")
     print("split chunk attention, one layer: first call at a new shape / repeat (ms), cudnn vs flash with log-sum-exp")
     for prefix, chunk in [(16384, 15616), (17152, 14848), (17920, 14080), (18688, 13312), (16384, 16383)]:
         q = torch.randn(1, args.heads, chunk, args.head_dim, device="cuda", dtype=torch.bfloat16)
         pk, pv = (torch.randn(1, args.heads, prefix, args.head_dim, device="cuda", dtype=torch.bfloat16) for _ in range(2))
         ck, cv = (torch.randn(1, args.heads, chunk, args.head_dim, device="cuda", dtype=torch.bfloat16) for _ in range(2))
         for name, use_cudnn in (("cudnn", True), ("flash", False)):
-            prefix_attention.USE_CUDNN = use_cudnn
+            prefix_attention.USE_CUDNN = prefix_attention.USE_CUDNN_LSE = use_cudnn
             def call():
                 a = prefix_attention.attention_with_lse(q, pk, pv, args.head_dim ** -0.5, False)
                 b = prefix_attention.attention_with_lse(q, ck, cv, args.head_dim ** -0.5, True)
@@ -82,7 +95,7 @@ def chunk_shapes(args):
             torch.cuda.synchronize()
             first = time.perf_counter() - start
             print(f"  prefix {prefix:6d} chunk {chunk:6d} {name:6s} first {first * 1000:8.1f}   repeat {timed(call) * 1000:8.2f}")
-    prefix_attention.USE_CUDNN = True
+    prefix_attention.USE_CUDNN, prefix_attention.USE_CUDNN_LSE = True, False
     print(f"  cudnn fallback flags: plain broken={prefix_attention._CUDNN_BROKEN} lse broken={prefix_attention._CUDNN_LSE_BROKEN}")
 
 

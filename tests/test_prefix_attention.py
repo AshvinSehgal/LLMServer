@@ -88,7 +88,8 @@ def test_cudnn_causal_attention_matches_flash_on_cuda(group_size, length):
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9, reason="Hopper required")
 @pytest.mark.parametrize("causal", [False, True])
-def test_cudnn_log_sum_exp_matches_the_reference_on_cuda(causal):
+def test_cudnn_log_sum_exp_matches_the_reference_on_cuda(causal, monkeypatch):
+    monkeypatch.setattr(prefix_attention, "USE_CUDNN_LSE", True)
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 4, 3000, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
     output, lse = attention_with_lse(q, k, v, 128 ** -0.5, causal)

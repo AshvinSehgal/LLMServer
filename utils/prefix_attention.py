@@ -18,6 +18,8 @@ import torch.nn.functional as F
 MIN_CONTEXT_FOR_SPLIT = 4096  # below this the masked kernel is fast enough, and the plain path stays bit-identical to before
 MIN_LENGTH_FOR_CUDNN = 2048   # the cuDNN kernel is about 1.8x faster than flash on H200 from 4096 tokens up, and no better at 1024
 USE_CUDNN = True
+USE_CUDNN_LSE = False  # off: cuDNN builds a plan per (query, key) shape, about 1 s each on first sight, and split chunks rarely repeat a shape
+LENGTH_BUCKET = 1024   # fresh prompts are padded to a multiple of this so cuDNN sees few distinct shapes
 _FLASH_BROKEN = False
 _CUDNN_BROKEN = False      # the plain cuDNN call failed
 _CUDNN_LSE_BROKEN = False  # the log-sum-exp operator failed (kept separate: the plain call may still work)
@@ -36,8 +38,11 @@ def causal_attention(q, new_keys, new_values, group_size, scale):
         try:
             from torch.nn.attention import SDPBackend, sdpa_kernel
             expand = lambda tensor: tensor.repeat_interleave(group_size, dim=0).unsqueeze(0)
+            length = q.shape[2]
+            padded = -(-length // LENGTH_BUCKET) * LENGTH_BUCKET
+            pad = lambda tensor: F.pad(tensor, (0, 0, 0, padded - length))  # causal: real queries never see the zero rows after them
             with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-                return F.scaled_dot_product_attention(q, expand(new_keys), expand(new_values), dropout_p=0.0, scale=scale, is_causal=True)
+                return F.scaled_dot_product_attention(pad(q), pad(expand(new_keys)), pad(expand(new_values)), dropout_p=0.0, scale=scale, is_causal=True)[:, :, :length]
         except Exception as error:
             _CUDNN_BROKEN = True
             warnings.warn(f"cuDNN attention unavailable ({error!r}); using the default kernels")
@@ -47,7 +52,7 @@ def causal_attention(q, new_keys, new_values, group_size, scale):
 def attention_with_lse(q, k, v, scale, causal):
     """q [B, H, Lq, D], k and v [B, H, Lk, D] -> (output like q, log-sum-exp float32 [B, H, Lq])."""
     global _FLASH_BROKEN, _CUDNN_LSE_BROKEN
-    if _cudnn_usable(q) and not _CUDNN_LSE_BROKEN:
+    if USE_CUDNN_LSE and _cudnn_usable(q) and not _CUDNN_LSE_BROKEN:
         try:  # PyTorch 2.5.1: (q, k, v, attn_bias, compute_log_sumexp, dropout_p, is_causal, return_debug_mask, *, scale); older builds lack attn_bias
             try:
                 result = torch.ops.aten._scaled_dot_product_cudnn_attention(q, k, v, None, True, 0.0, causal, False, scale=scale)
