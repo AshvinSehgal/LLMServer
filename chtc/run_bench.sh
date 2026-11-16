@@ -193,6 +193,13 @@ if [ "${MODE:-bench}" = "serve" ]; then
   exit 0
 fi
 
+if [ "${MODE:-bench}" = "prefillstep" ]; then
+  # Why one prefill step costs ~24-31 ms in the serving run (diag_prefill_step.py): wall time, Python hot spots, kernel launches, GPU busy time.
+  python diag_prefill_step.py --model "$MODEL" > "$RESULTS/prefill_step.txt" 2>&1 || note "WARNING: diag_prefill_step.py failed; see prefill_step.txt"
+  grep -v "Fetching\|Loading\|Warning\|deprecated" "$RESULTS/prefill_step.txt" | tee -a "$STATUS"
+  exit 0
+fi
+
 if [ "${MODE:-bench}" = "diag" ]; then
   # Per-step decode timing for long contexts (diag_long_decode.py): which path each step took and how long it took.
   python diag_long_decode.py --model "$MODEL" --prompt-tokens "${DIAG_PROMPT_TOKENS:-16384}" --batch "${DIAG_BATCH:-4}" > "$RESULTS/diag_decode.txt" 2>&1 || note "WARNING: diag_long_decode.py failed; see diag_decode.txt"
