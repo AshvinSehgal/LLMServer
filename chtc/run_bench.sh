@@ -180,7 +180,13 @@ if [ "${MODE:-bench}" = "serve" ]; then
     fi
     kill "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null
   }
-  serve_one engine 18000 python server.py --model "$MODEL" --device cuda --dtype bfloat16 --max-batch-size 32 --max-context 4096 --max-new-tokens 256 --max-num-batched-tokens 8192 --host 127.0.0.1 --port 18000
+  # The prefill token budget decides how long one step can stall every running decode: ENGINE_TOKENS lists the budgets to try (first = the default tag "engine").
+  first_budget=1
+  for budget in $(echo "${ENGINE_TOKENS:-8192}" | tr : ' '); do
+    if [ "$first_budget" = "1" ]; then name=engine; else name=engine_$budget; fi
+    first_budget=0
+    serve_one "$name" 18000 python server.py --model "$MODEL" --device cuda --dtype bfloat16 --max-batch-size 32 --max-context 4096 --max-new-tokens 256 --max-num-batched-tokens "$budget" --host 127.0.0.1 --port 18000
+  done
   if [ -n "$VLLM_PYTHON" ]; then
     serve_one vllm 18001 "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server --model "$MODEL" --served-model-name "$MODEL_ID" --dtype bfloat16 --max-model-len 4096 --max-num-seqs 32 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.85 --host 127.0.0.1 --port 18001
   fi
