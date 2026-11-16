@@ -173,6 +173,8 @@ if [ "${MODE:-bench}" = "serve" ]; then
     if [ "$ready" = "1" ]; then
       python serve_bench.py --base-url "http://127.0.0.1:$port" --model "$MODEL_ID" --rates "$(echo "${RATES:-2,4,8,16,inf}" | tr : ,)" --requests "${SERVE_REQUESTS:-96}" --json "$RESULTS/serve_${name}.json" > "$RESULTS/serve_${name}.txt" 2>&1 || note "WARNING: load test against $name failed; see serve_${name}.txt"
       note "serving results, $name:"; grep "^rate" "$RESULTS/serve_${name}.txt" | tee -a "$STATUS"
+      # The engine's own per-phase step timings (scheduling, decode, prefill, time yielded to HTTP handlers); vllm has no such endpoint.
+      python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:$port/api/info', timeout=10).read().decode())" > "$RESULTS/serve_${name}_info.json" 2>/dev/null || rm -f "$RESULTS/serve_${name}_info.json"
     else
       note "WARNING: $name server did not become ready; see serve_${name}_server.log"
     fi

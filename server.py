@@ -208,7 +208,8 @@ def create_app(service):
     @app.get("/api/info")
     async def info():
         return {"model": service.model_name, "device": str(service.engine.device) if service.engine else None, "max_context": service.max_context,
-                "max_new_tokens": service.engine.max_new_tokens if service.engine else None, "loading": service.loading, "device_memory_gb": device_memory_gb()}
+                "max_new_tokens": service.engine.max_new_tokens if service.engine else None, "loading": service.loading, "device_memory_gb": device_memory_gb(),
+                "step_profile": getattr(service.engine, "step_profile", None)}
 
     @app.get("/api/models")
     async def available_models():

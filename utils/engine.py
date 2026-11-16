@@ -2,6 +2,7 @@ import asyncio
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta
+import time
 import torch
 import math
 import hashlib
@@ -65,6 +66,7 @@ class Engine:
         self.max_completed_requests = max_completed_requests
         self.completed_request_ttl = timedelta(seconds=completed_request_ttl_seconds)
         self.scheduler = Scheduler(max_batch_size, max_num_batched_tokens, prefill_chunk_size)
+        self.step_profile = {"steps": 0, "decode_steps": 0, "prefill_steps": 0, "schedule_s": 0.0, "decode_s": 0.0, "prefill_s": 0.0, "yield_s": 0.0, "decode_by_rows": {}}
         self.active_requests = {}
         self.completed_requests = OrderedDict()
         self.stream_decoders = {}
@@ -428,11 +430,33 @@ class Engine:
         return bool(self.scheduler.waiting or self.scheduler.running)
     
     async def run(self):
+        profile = self.step_profile
+        clock = time.perf_counter
         while self.scheduler.waiting or self.scheduler.running:
+            t0 = clock()
             scheduler_output = self.schedule_step()
+            t1 = clock()
+            rows = len(scheduler_output.decode_requests)
             self.process_decode_batch(scheduler_output)
             self.remove_finished_and_cancelled_requests()
+            t2 = clock()
             await asyncio.sleep(0)
+            t3 = clock()
+            had_prefill = bool(scheduler_output.prefill_requests)
             self.process_prefill_batch(scheduler_output)
             self.remove_finished_and_cancelled_requests()
+            t4 = clock()
             await asyncio.sleep(0)
+            t5 = clock()
+            profile["steps"] += 1
+            profile["schedule_s"] += t1 - t0
+            profile["decode_s"] += t2 - t1
+            profile["prefill_s"] += t4 - t3
+            profile["yield_s"] += (t3 - t2) + (t5 - t4)  # time other tasks (HTTP handlers, SSE writers) ran between phases
+            if rows:
+                profile["decode_steps"] += 1
+                bucket = profile["decode_by_rows"].setdefault(rows, [0, 0.0])
+                bucket[0] += 1
+                bucket[1] += t2 - t1
+            if had_prefill:
+                profile["prefill_steps"] += 1

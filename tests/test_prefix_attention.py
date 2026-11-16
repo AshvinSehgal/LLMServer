@@ -105,3 +105,16 @@ def test_warmup_does_nothing_without_cuda():
     if torch.cuda.is_available():
         pytest.skip("CPU behaviour")
     assert prefix_attention.warmup(torch.device("cpu"), torch.float32, 4, 16, 8192, 0.25) == 0
+
+
+def test_engine_run_records_a_step_profile():
+    import asyncio
+    prompt = list(range(3, 20))
+    engine = Engine(tiny_model(seed=0), FakeTokenizer({"a": prompt}), max_new_tokens=5, max_batch_size=2, max_num_batched_tokens=64,
+                    kv_cache_num_blocks=32, kv_cache_block_size=4, stream_text=False)
+    engine.add_request(None, prompt_token_ids=prompt)
+    engine.add_request(None, prompt_token_ids=prompt[:9])
+    asyncio.run(engine.run())
+    profile = engine.step_profile
+    assert profile["steps"] > 0 and profile["decode_steps"] > 0 and profile["prefill_steps"] > 0
+    assert sum(count for count, _ in profile["decode_by_rows"].values()) == profile["decode_steps"]
