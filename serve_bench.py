@@ -40,7 +40,9 @@ def build_workload(count, seed):
 
 
 async def one_request(client, url, model, job, max_tokens, results):
-    payload = {"model": model, "messages": job["messages"], "max_tokens": max_tokens, "temperature": 0.0, "stream": True, "stream_options": {"include_usage": True}}
+    payload = {"model": model, "messages": job["messages"], "max_tokens": max_tokens, "temperature": 0.0, "stream": True, "stream_options": {"include_usage": True},
+               # Qwen3 thinks by default under vLLM's chat template but not under this server's: ask both for the same thing, or replies differ in length
+               "enable_thinking": False, "chat_template_kwargs": {"enable_thinking": False}}
     sent = time.perf_counter()
     first = None
     completion_tokens = None
@@ -93,7 +95,7 @@ async def run_rate(args, rate, seed):
     good = [r for r in results if "error" not in r]
     errors = len(results) - len(good)
     tokens = sum(r["tokens"] for r in good)
-    return {"rate": rate, "requests": len(results), "errors": errors, "wall_s": wall, "req_per_s": len(good) / wall, "output_tok_per_s": tokens / wall,
+    return {"rate": rate, "requests": len(results), "errors": errors, "wall_s": wall, "req_per_s": len(good) / wall, "output_tok_per_s": tokens / wall, "mean_reply_tokens": tokens / max(len(good), 1),
             "ttft_p50": percentile([r["ttft"] for r in good], 0.5), "ttft_p90": percentile([r["ttft"] for r in good], 0.9), "ttft_p99": percentile([r["ttft"] for r in good], 0.99),
             "tpot_p50": percentile([r["tpot"] for r in good], 0.5), "tpot_p90": percentile([r["tpot"] for r in good], 0.9), "tpot_p99": percentile([r["tpot"] for r in good], 0.99),
             "e2e_p50": percentile([r["e2e"] for r in good], 0.5), "e2e_p99": percentile([r["e2e"] for r in good], 0.99)}
@@ -107,7 +109,7 @@ async def main_async(args):
     for rate in [float("inf") if value == "inf" else float(value) for value in args.rates.split(",")]:
         summary = await run_rate(args, rate, args.seed)
         summaries.append(summary)
-        print(f"rate {'burst' if rate == float('inf') else rate:>5} req/s | done {summary['requests'] - summary['errors']:>3}/{summary['requests']} | {summary['req_per_s']:6.2f} req/s {summary['output_tok_per_s']:8.1f} out tok/s | "
+        print(f"rate {'burst' if rate == float('inf') else rate:>5} req/s | done {summary['requests'] - summary['errors']:>3}/{summary['requests']} | {summary['req_per_s']:6.2f} req/s {summary['output_tok_per_s']:8.1f} out tok/s ({summary['mean_reply_tokens']:.0f} tok/reply) | "
               f"TTFT p50 {summary['ttft_p50'] * 1000:7.0f} p90 {summary['ttft_p90'] * 1000:7.0f} p99 {summary['ttft_p99'] * 1000:7.0f} ms | "
               f"TPOT p50 {summary['tpot_p50'] * 1000:6.1f} p90 {summary['tpot_p90'] * 1000:6.1f} p99 {summary['tpot_p99'] * 1000:6.1f} ms | E2E p50 {summary['e2e_p50']:5.2f} p99 {summary['e2e_p99']:5.2f} s", flush=True)
     if args.json:

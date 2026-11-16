@@ -132,3 +132,7 @@ The fresh-prompt path also has the plan cost: its first call at a new bucket (15
 ## v9.39 results
 
 Time to first token matches v9.38 in every cell (8B: 0.87x to 0.90x of vLLM at 4096 and 16384 tokens, 0.74x and 0.69x at 32000; 1.7B: 0.80x to 0.85x, 0.65x and 0.60x), with no cold first run and no errors; decode is unchanged (0.97x to 1.11x, except the 16384-token batch-4 chunking artifact). The prefill work is finished here: fresh prompts use cuDNN with warmed plans, split chunks use flash, and the remaining 32000-token gap (0.6x to 0.74x) is the split chunk running on flash.
+
+## Why the serving replies differed in length (found in the v9.29 serving logs, fixed in v9.40)
+
+The engine averaged about 76 tokens per reply and vLLM 128 (every vLLM reply hit `max_tokens`: end-to-end 0.78 s is 128 tokens at 6 ms). Cause: Qwen3's chat template thinks by default, vLLM applies it as is, while this server's `enable_thinking` defaults to false, so the two ran different prompts. The load generator now sends `enable_thinking: false` (and `chat_template_kwargs`) to both and prints the mean reply length per rate, so the comparison is on equal footing. The earlier serving numbers compared a thinking vLLM against a non-thinking engine: vLLM's per-token times were lower (steady 6 ms) with the same output tokens/s accounting, but its throughput figures included longer replies. Rerun `chtc/bench_serve.sub` before drawing conclusions about p99 inter-token latency.
