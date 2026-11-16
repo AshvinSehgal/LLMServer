@@ -150,3 +150,7 @@ The engine's decode phase is not the problem: it takes 2.4 ms (1.7B) and 5.7 ms 
 Two smaller findings: decode steps at 9, 17 and 26 rows cost 2 to 4 times the neighbouring sizes (5.0, 7.2, 23 ms on the 1.7B), which looks like CUDA graphs being captured lazily the first time a batch bucket is seen; capturing them at start-up would remove those p99 spikes.
 
 v9.42 makes the prefill token budget a sweep in the serving job (`ENGINE_TOKENS=8192:2048:512`, files `serve_engine*.txt` and `serve_engine_<budget>_info.json`): a smaller budget chunks long prompts and caps how long one step can stall decoding. No engine change yet.
+
+## Prefill token budget sweep (v9.42 results) and a start-up bug (v9.43)
+
+Budgets 8192 and 2048 give the same serving latency (1.7B at 32 req/s: TPOT p50 9.1 vs 10.3 ms, 8B at 16 req/s 11.1 vs 12.0 ms; vLLM 2.8 and 6.2 ms) and the same 397 prefill steps costing 22.5 to 24.5 ms each. The sweep did not test anything: the longest prompts (about 1800 tokens plus the system prompt) fit in 2048, so no prompt was chunked. The 512 run did not start, because of a bug in the v9.39 cuDNN warm-up: with a token budget below 2048 the loop built nothing and `del tensor` failed on an unbound name, which would also break any server started with a small `--max-num-batched-tokens` on CUDA. v9.43 fixes it (with a test) and sweeps 8192:1024:512:256, which do chunk the long prompts.

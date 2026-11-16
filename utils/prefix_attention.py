@@ -56,11 +56,13 @@ def warmup(device, dtype, n_heads, head_dim, max_length, scale):
     if not _cudnn_usable(dummy):
         return 0
     count = 0
+    tensor = None
     for length in range(-(-MIN_LENGTH_FOR_CUDNN // LENGTH_BUCKET) * LENGTH_BUCKET, min(max_length, 1 << 20) + 1, LENGTH_BUCKET):
         tensor = torch.zeros(1, n_heads, length, head_dim, device=device, dtype=dtype)
         causal_attention(tensor, tensor[0, :1], tensor[0, :1], n_heads, scale)
         count += 1
-    torch.cuda.synchronize()
+    if count:
+        torch.cuda.synchronize()
     del tensor
     return count
 

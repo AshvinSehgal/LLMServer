@@ -118,3 +118,8 @@ def test_engine_run_records_a_step_profile():
     profile = engine.step_profile
     assert profile["steps"] > 0 and profile["decode_steps"] > 0 and profile["prefill_steps"] > 0
     assert sum(count for count, _ in profile["decode_by_rows"].values()) == profile["decode_steps"]
+
+
+def test_warmup_with_a_budget_below_the_first_bucket_builds_nothing(monkeypatch):
+    monkeypatch.setattr(prefix_attention, "_cudnn_usable", lambda q: True)
+    assert prefix_attention.warmup(torch.device("cpu"), torch.float32, 4, 16, 512, 0.25) == 0
