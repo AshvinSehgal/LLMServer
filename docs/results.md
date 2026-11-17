@@ -175,6 +175,10 @@ Serving, engine vs vLLM, thinking off. 1.7B at 32 req/s: TPOT p50 5.4 vs 2.9 ms 
 
 What remains is the stall: each prefill step (14 to 20 ms) blocks every decoding stream, which is the TPOT gap above 8 req/s. Remaining options are concurrent prefill on a second thread and stream, fewer launches per layer, or mixed prefill and decode steps.
 
-## One-gather expanded cache read (v9.46, untested on a GPU)
+## One-gather expanded cache read (v9.46)
 
 Per layer, the resumed-prefill path (a short prompt behind the cached system prompt) did a gather per tensor and then two `repeat_interleave` calls to expand the KV heads for the masked attention. `PagedKVCache.get_expanded` does the gather and the head expansion together, one `index_select` per tensor on a memoized row index (head-major, so the result is contiguous and identical in value). That removes about two launches per layer (about 56 of 634 on the 1.7B), expected to be roughly 1 ms of a 12 ms step: a small gain, not a fix. Still per layer and not touched: the mask padding inside the efficient-attention call (28 `pad`), the 112 Triton launches whose Python launcher costs about 5 ms, and the 113 `linear` calls. Re-run `chtc/bench_prefillstep.sub` to measure.
+
+### v9.46 results (H200)
+
+Kernel launches fell as planned (1.7B 634 to 578, 8B 730 to 658), but the step time barely moved: short prompt 11.91 ms on the 1.7B (11.90 before) and 13.98 ms on the 8B (15.48 before); medium 12.50 and 24.77 ms; long 20.33 and 59.21 ms. The launches removed were cheap ones, so about 1 ms was the ceiling and only the 8B shows it. A 28-token and a 540-token step cost the same on the 1.7B (11.9 and 12.5 ms), so the step is a fixed Python-and-launcher cost of roughly 0.4 ms per layer. Shaving individual launches will not close the remaining gap; what would is removing the per-layer Python (a CUDA graph of the prefill, which needs fixed shapes, or the launcher bypass) or overlapping prefill with decode.
