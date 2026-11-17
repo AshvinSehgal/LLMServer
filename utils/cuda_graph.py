@@ -65,6 +65,19 @@ class CudaGraphDecodeRunner:
         self.graphs[bucket] = graph
         self.outputs[bucket] = output
 
+    def warmup(self):
+        """Capture every bucket's graph now, with one dummy token at slot 0 and context length 1, so no request pays the capture the first time its
+        batch size reaches a new bucket (2 to 8 times a normal step, a p99 spike). The cache must be empty: slot 0 is overwritten."""
+        self.header_np[:] = 0
+        self.header_np[3] = 1
+        self.tables_np[:] = 0
+        self.header.copy_(self.header_host)
+        self.tables.copy_(self.tables_host)
+        for bucket in self.buckets:
+            if bucket not in self.graphs:
+                self.capture(bucket)
+        torch.cuda.synchronize(self.device)
+
     def run(self, token_ids, positions, slots, lengths, block_tables):
         """block_tables: int array [rows, max_blocks]. Returns the greedy next token for each real row."""
         rows = len(token_ids)

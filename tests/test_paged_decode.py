@@ -219,6 +219,28 @@ def test_cuda_graph_engine_generates_the_same_tokens(batch):
     assert engine.graph_runner is not None and engine.graph_runner.graphs
 
 
+@triton_only
+def test_graph_warmup_captures_every_bucket_and_does_not_change_the_output():
+    model = tiny_model().to("cuda")
+    prompts = {"a": [5, 9, 3, 7, 11], "b": [12, 4, 8]}
+
+    def run(warm):
+        engine = Engine(model, FakeTokenizer(prompts), max_new_tokens=12, max_batch_size=8, max_num_batched_tokens=64, kv_cache_num_blocks=64, kv_cache_block_size=16, stream_text=False, paged_decode=True, cuda_graphs=True)
+        if warm:
+            assert engine.warmup_graphs() == len(engine.graph_runner.buckets)
+        requests = [engine.add_request(prompt) for prompt in prompts]
+        while engine.step():
+            pass
+        return [request.generated_token_ids for request in requests]
+
+    assert run(True) == run(False)
+
+
+def test_engine_warmup_graphs_is_a_no_op_without_a_graph_runner():
+    engine = Engine(tiny_model(), FakeTokenizer({}), max_new_tokens=4, max_batch_size=2, max_num_batched_tokens=32, kv_cache_num_blocks=16, kv_cache_block_size=4, stream_text=False)
+    assert engine.warmup_graphs() == 0
+
+
 def test_engine_accepts_token_ids_and_can_ignore_eos():
     model = tiny_model()
     tokenizer = FakeTokenizer({})

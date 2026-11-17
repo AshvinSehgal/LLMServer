@@ -329,6 +329,7 @@ def build_engine(args, model_name, device, dtype):
     engine = Engine(model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, max_batch_size=args.max_batch_size,
                     max_num_batched_tokens=args.max_num_batched_tokens, kv_cache_num_blocks=blocks_per_sequence * args.max_batch_size,
                     kv_cache_block_size=args.block_size, stream_text=True, draft_model=draft_model, num_draft_tokens=args.draft_tokens)
+    engine.warmup_graphs()
     return engine, tokenizer
 
 

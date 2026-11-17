@@ -363,18 +363,23 @@ class PagedKVCache:
             keys = self.key_cache[layer_index, first_block:last_block].reshape(-1, self.num_kv_heads, self.head_dim)[:end_pos].permute(1, 0, 2)
             values = self.value_cache[layer_index, first_block:last_block].reshape(-1, self.num_kv_heads, self.head_dim)[:end_pos].permute(1, 0, 2)
             return keys, values
-        keys = []
-        values = []
-        for i in range(num_reqd_blocks):
-            physical_block = block_table[i]
-            if physical_block not in self.allocated_blocks:
-                raise KVCacheStateError(f"Block {physical_block} is not an allocated block")
-            tokens_from_block = min(self.block_size, end_pos - (i * self.block_size))
-            key_piece = self.key_cache[layer_index, physical_block, :tokens_from_block].permute(1, 0, 2)
-            value_piece = self.value_cache[layer_index, physical_block, :tokens_from_block].permute(1, 0, 2)
-            keys.append(key_piece)
-            values.append(value_piece)
-        return torch.cat(keys, dim=1), torch.cat(values, dim=1)
+        # Blocks are not consecutive (a shared cached prefix followed by fresh blocks): one gather by flat slot per tensor instead of a slice per
+        # block and a concatenate, which launched about 30 small kernels per layer. The slot index is memoized across the layers of a pass.
+        key = ("read", tuple(physical_blocks), end_pos)
+        slots = self.slot_memo.get(key)
+        if slots is None:
+            for physical_block in physical_blocks:
+                if physical_block not in self.allocated_blocks:
+                    raise KVCacheStateError(f"Block {physical_block} is not an allocated block")
+            if len(self.slot_memo) >= 256:
+                self.slot_memo.clear()
+            positions = np.arange(end_pos)
+            blocks = np.asarray(physical_blocks, dtype=np.int64)[positions // self.block_size]
+            slots = torch.from_numpy(blocks * self.block_size + positions % self.block_size).to(self.key_cache.device)
+            self.slot_memo[key] = slots
+        keys = self.key_cache[layer_index].view(-1, self.num_kv_heads, self.head_dim).index_select(0, slots).permute(1, 0, 2)
+        values = self.value_cache[layer_index].view(-1, self.num_kv_heads, self.head_dim).index_select(0, slots).permute(1, 0, 2)
+        return keys, values
 
     def get_batch(self, layer_index, block_tables, end_pos):
         if layer_index < 0 or layer_index >= self.num_layers:

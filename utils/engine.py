@@ -147,6 +147,19 @@ class Engine:
         if (cuda_graphs if cuda_graphs is not None else on_cuda) and on_cuda:
             self.graph_runner = CudaGraphDecodeRunner(self.model, self.kv_cache, max_batch_size, self.paged_max_blocks, self.device)
 
+    def warmup_graphs(self):
+        """Capture the decode graph of every batch bucket before serving (an idle engine only: it writes one dummy token to cache slot 0)."""
+        if self.graph_runner is None or self.active_requests:
+            return 0
+        try:
+            self.graph_runner.warmup()
+        except Exception as error:
+            warnings.warn(f"CUDA graph warm-up failed ({error!r}); graphs will be captured on first use")
+            self.graph_runner.graphs.clear()
+            self.graph_runner.outputs.clear()
+            return 0
+        return len(self.graph_runner.graphs)
+
     @torch.inference_mode()
     def run_paged_decode(self, requests):
         """Greedy next tokens for single-token decode requests, or None if this step must use the gather path."""
