@@ -381,6 +381,39 @@ class PagedKVCache:
         values = self.value_cache[layer_index].view(-1, self.num_kv_heads, self.head_dim).index_select(0, slots).permute(1, 0, 2)
         return keys, values
 
+    def get_expanded(self, layer_index, block_table, end_pos, group_size):
+        """Keys and values of one request as [1, num_kv_heads * group_size, end_pos, head_dim], each KV head repeated group_size times.
+
+        Same values as get() followed by repeat_interleave on the head axis, but one gather per tensor (the row index is memoized across the
+        layers of a pass) instead of a gather and two repeats, which saves about two kernel launches per layer on a host-bound prefill step.
+        """
+        if layer_index < 0 or layer_index >= self.num_layers:
+            raise IndexError(f"Invalid layer index: {layer_index}, num_layers: {self.num_layers}")
+        if end_pos <= 0:
+            raise ValueError(f"end_pos must be positive: {end_pos}")
+        num_reqd_blocks = math.ceil(end_pos / self.block_size)
+        if num_reqd_blocks > len(block_table):
+            raise IndexError(f"Number of blocks required {num_reqd_blocks} is more than the block table has")
+        physical_blocks = block_table[:num_reqd_blocks]
+        key = ("expand", tuple(physical_blocks), end_pos, group_size)
+        rows = self.slot_memo.get(key)
+        if rows is None:
+            for physical_block in physical_blocks:
+                if physical_block not in self.allocated_blocks:
+                    raise KVCacheStateError(f"Block {physical_block} is not an allocated block")
+            if len(self.slot_memo) >= 256:
+                self.slot_memo.clear()
+            positions = np.arange(end_pos)
+            blocks = np.asarray(physical_blocks, dtype=np.int64)[positions // self.block_size]
+            slots = blocks * self.block_size + positions % self.block_size
+            query_heads = np.arange(self.num_kv_heads * group_size) // group_size
+            rows = torch.from_numpy((slots[None, :] * self.num_kv_heads + query_heads[:, None]).reshape(-1)).to(self.key_cache.device)
+            self.slot_memo[key] = rows
+        shape = (1, self.num_kv_heads * group_size, end_pos, self.head_dim)
+        keys = self.key_cache[layer_index].view(-1, self.head_dim).index_select(0, rows).view(shape)
+        values = self.value_cache[layer_index].view(-1, self.head_dim).index_select(0, rows).view(shape)
+        return keys, values
+
     def get_batch(self, layer_index, block_tables, end_pos):
         if layer_index < 0 or layer_index >= self.num_layers:
             raise IndexError(f"Invalid layer index: {layer_index}, num_layers: {self.num_layers}")

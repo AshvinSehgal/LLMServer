@@ -278,11 +278,12 @@ class SelfAttention(nn.Module):
                             prefix_keys, prefix_values = kv_cache.get(layer_index, request_block_table, request_start_pos)
                             request_attention_scores = prefix_attention.chunk_attention(request_q, new_keys, new_values, prefix_keys, prefix_values, group_size, self.attention_scaling)
                         else:
-                            cached_keys, cached_values = kv_cache.get(layer_index, request_block_table, request_end_pos)
-                            cached_keys = cached_keys.unsqueeze(0)
-                            cached_values = cached_values.unsqueeze(0)
-                            cached_keys = torch.repeat_interleave(cached_keys, repeats=group_size, dim=1)
-                            cached_values = torch.repeat_interleave(cached_values, repeats=group_size, dim=1)
+                            if hasattr(kv_cache, "get_expanded"):
+                                cached_keys, cached_values = kv_cache.get_expanded(layer_index, request_block_table, request_end_pos, group_size)
+                            else:
+                                cached_keys, cached_values = kv_cache.get(layer_index, request_block_table, request_end_pos)
+                                cached_keys = torch.repeat_interleave(cached_keys.unsqueeze(0), repeats=group_size, dim=1)
+                                cached_values = torch.repeat_interleave(cached_values.unsqueeze(0), repeats=group_size, dim=1)
                             request_mask = causal_mask[batch_index:batch_index + 1, :, :request_input_len, :request_end_pos]
                             if self.use_sdpa:
                                 request_attention_scores = F.scaled_dot_product_attention(request_q, cached_keys, cached_values, attn_mask=request_mask, dropout_p=0.0, scale=self.attention_scaling)

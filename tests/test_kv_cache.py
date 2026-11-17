@@ -777,6 +777,26 @@ def test_paged_kv_cache_gets_non_contiguous_physical_blocks_in_logical_order():
     assert torch.equal(cached_keys, torch.cat((first_keys, second_keys), dim=1))
     assert torch.equal(cached_values, torch.cat((first_values, second_values), dim=1))
 
+@pytest.mark.parametrize("group_size", [1, 3])
+def test_paged_kv_cache_get_expanded_matches_get_then_repeat_interleave(group_size):
+    cache = PagedKVCache(num_layers=2, num_blocks=6, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device("cpu"), dtype=torch.float32)
+    cache.allocate_block()
+    block_table = []
+    for layer_index in range(2):
+        cache.append(layer_index, block_table, 0, torch.arange(24, dtype=torch.float32).reshape(2, 4, 3) + layer_index * 50, torch.arange(24, dtype=torch.float32).reshape(2, 4, 3) + 100)
+    cache.allocate_block()
+    for layer_index in range(2):
+        cache.append(layer_index, block_table, 4, torch.arange(12, dtype=torch.float32).reshape(2, 2, 3) + 200 + layer_index, torch.arange(12, dtype=torch.float32).reshape(2, 2, 3) + 300)
+    assert block_table == [1, 3]
+    for layer_index in range(2):
+        for end_pos in (3, 4, 6):
+            keys, values = cache.get(layer_index, block_table, end_pos)
+            expanded_keys, expanded_values = cache.get_expanded(layer_index, block_table, end_pos, group_size)
+            assert torch.equal(expanded_keys, torch.repeat_interleave(keys.unsqueeze(0), group_size, dim=1))
+            assert torch.equal(expanded_values, torch.repeat_interleave(values.unsqueeze(0), group_size, dim=1))
+    with pytest.raises(IndexError):
+        cache.get_expanded(0, block_table, 9, group_size)
+
 @pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
 def test_paged_kv_cache_get_batch_matches_individual_get_across_blocks(device):
     cache = PagedKVCache(num_layers=2, num_blocks=6, block_size=4, num_kv_heads=2, head_dim=3, device=torch.device(device), dtype=torch.float32)
